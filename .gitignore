@@ -1,4 +1,12 @@
 data/fineweb10B/
 pylog124M/
 logs/
+runs/
 wandb/
+
+# my files
+notes.md
+AGENTS.md
+DECISIONS.md
+.venv*/
+__pycache__/
