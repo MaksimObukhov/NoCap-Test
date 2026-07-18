@@ -17,6 +17,11 @@ if [[ "${VAST_AUTO_STOP:-1}" == "1" ]]; then
     echo "vastai CLI is missing; install it before starting the suite." >&2
     exit 2
   fi
+  if [[ -z "${CONTAINER_API_KEY:-}" ]]; then
+    echo "CONTAINER_API_KEY is missing; auto-stop would fail unauthenticated." >&2
+    echo "Set VAST_AUTO_STOP=0 only if you will stop the instance manually." >&2
+    exit 2
+  fi
 fi
 
 stop_vast_instance() {
@@ -27,7 +32,19 @@ stop_vast_instance() {
   if [[ "${VAST_AUTO_STOP:-1}" == "1" && -n "${CONTAINER_ID:-}" ]]; then
     if command -v vastai >/dev/null 2>&1; then
       echo "Stopping Vast instance $CONTAINER_ID to end GPU billing."
-      vastai stop instance "$CONTAINER_ID" || true
+      stopped=0
+      for attempt in 1 2 3; do
+        if vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"; then
+          echo "Vast instance $CONTAINER_ID stop request succeeded."
+          stopped=1
+          break
+        fi
+        echo "WARNING: vastai stop failed (attempt $attempt); retrying in 30s." >&2
+        sleep 30
+      done
+      if [[ "$stopped" != "1" ]]; then
+        echo "ERROR: auto-stop FAILED; stop the instance manually to end billing." >&2
+      fi
     else
       echo "WARNING: vastai CLI is unavailable; stop the instance manually." >&2
     fi
