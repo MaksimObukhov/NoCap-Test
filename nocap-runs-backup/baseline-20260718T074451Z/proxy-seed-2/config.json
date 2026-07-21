@@ -1,0 +1,37 @@
+{
+  "args": {
+    "batch_size": 16,
+    "grad_accumulation_steps": 32,
+    "input_bin": "data/fineweb10B/fineweb_train_*.bin",
+    "input_val_bin": "data/fineweb10B/fineweb_val_*.bin",
+    "learning_rate": 0.0018,
+    "log_wandb": true,
+    "model": "d12",
+    "num_iterations": 1788,
+    "output_dir": "runs/baseline-20260718T074451Z/proxy-seed-2",
+    "resume": "",
+    "run_mode": "proxy",
+    "run_name": "proxy-seed-2",
+    "save_every": 256,
+    "seed": 2,
+    "sequence_length": 1024,
+    "val_batch_size": 16,
+    "val_loss_every": 128,
+    "wandb_group": "baseline-20260718T074451Z",
+    "wandb_project": "nocap-baseline",
+    "warmdown_iters": 384,
+    "warmup_iters": 96,
+    "weight_decay": 0.1
+  },
+  "metadata": {
+    "cuda_version": "12.8",
+    "cudnn_version": 91900,
+    "git_commit": "bd681a332c372ddaf4061c94cc2e49ca21cf8528",
+    "git_dirty": true,
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "run_id": "44a752aa2dc54481bfce4bffa759b47a",
+    "seed": 2,
+    "torch_version": "2.11.0+cu128",
+    "world_size": 1
+  }
+}

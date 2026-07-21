@@ -1,0 +1,37 @@
+{
+  "args": {
+    "batch_size": 16,
+    "grad_accumulation_steps": 32,
+    "input_bin": "data/fineweb10B/fineweb_train_*.bin",
+    "input_val_bin": "data/fineweb10B/fineweb_val_*.bin",
+    "learning_rate": 0.0018,
+    "log_wandb": true,
+    "model": "d12",
+    "num_iterations": 4768,
+    "output_dir": "runs/baseline-20260718T074451Z/full-seed-0",
+    "resume": "",
+    "run_mode": "full",
+    "run_name": "full-seed-0",
+    "save_every": 512,
+    "seed": 0,
+    "sequence_length": 1024,
+    "val_batch_size": 16,
+    "val_loss_every": 128,
+    "wandb_group": "baseline-20260718T074451Z",
+    "wandb_project": "nocap-baseline",
+    "warmdown_iters": 1024,
+    "warmup_iters": 256,
+    "weight_decay": 0.1
+  },
+  "metadata": {
+    "cuda_version": "12.8",
+    "cudnn_version": 91900,
+    "git_commit": "bd681a332c372ddaf4061c94cc2e49ca21cf8528",
+    "git_dirty": true,
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "run_id": "d34b36c3bd6c438e9a18fddae8044dc7",
+    "seed": 0,
+    "torch_version": "2.11.0+cu128",
+    "world_size": 1
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "final_val_losses": [
+    3.5977730751037598,
+    3.601308822631836,
+    3.5989701747894287
+  ],
+  "mean_final_val_loss": 3.599350690841675,
+  "mode": "proxy",
+  "n": 3,
+  "sample_std_final_val_loss": 0.0017983247746408055,
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "total_tokens": 2812280832,
+  "total_training_time_seconds": 22344.92855924368
+}
+saved runs/baseline-20260718T074451Z/proxy_statistics.json

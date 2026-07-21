@@ -1,0 +1,17 @@
+{
+  "final_val_loss": 3.5989701747894287,
+  "git_commit": "bd681a332c372ddaf4061c94cc2e49ca21cf8528",
+  "git_dirty": true,
+  "gpu_name": "NVIDIA GeForce RTX 4090",
+  "num_iterations": 1788,
+  "peak_memory_mib": 9825,
+  "run_id": "44a752aa2dc54481bfce4bffa759b47a",
+  "run_mode": "proxy",
+  "run_name": "proxy-seed-2",
+  "seed": 2,
+  "status": "complete",
+  "tokens_per_second": 125155.21986541693,
+  "tokens_seen": 937426944,
+  "training_time_seconds": 7490.114635314792,
+  "wall_time_seconds": 7666.1702154167
+}

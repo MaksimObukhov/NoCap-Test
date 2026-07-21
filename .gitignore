@@ -10,3 +10,5 @@ AGENTS.md
 DECISIONS.md
 .venv*/
 __pycache__/
+.claude/
+*.pt
