@@ -415,6 +415,29 @@ if __name__ == "__main__":
         default=0,
         help="overwrite the resumable checkpoint every N updates; 0 disables periodic saves",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="capture a short CPU/CUDA profiler trace",
+    )
+    parser.add_argument(
+        "--profile_wait_steps",
+        type=int,
+        default=3,
+        help="optimizer steps to skip before profiler warmup",
+    )
+    parser.add_argument(
+        "--profile_warmup_steps",
+        type=int,
+        default=1,
+        help="profiler warmup steps to collect and discard",
+    )
+    parser.add_argument(
+        "--profile_active_steps",
+        type=int,
+        default=1,
+        help="optimizer steps to save in the profiler trace",
+    )
     parser.add_argument("--log_wandb", action="store_true", help="log to W&B")
     parser.add_argument("--wandb_project", type=str, default="nocap-baseline")
     parser.add_argument("--wandb_group", type=str, default="")
@@ -425,6 +448,18 @@ if __name__ == "__main__":
     assert args.num_iterations > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
     assert args.save_every >= 0
+    assert args.profile_wait_steps >= 0
+    assert args.profile_warmup_steps >= 0
+    assert args.profile_active_steps > 0
+    profile_schedule_steps = (
+        args.profile_wait_steps
+        + args.profile_warmup_steps
+        + args.profile_active_steps
+    )
+    if args.profile:
+        assert args.num_iterations >= profile_schedule_steps, (
+            "--num_iterations must cover profile wait + warmup + active steps"
+        )
     assert torch.cuda.is_available(), "CUDA is required"
 
     # torchrun supplies these variables. WORLD_SIZE=1 is still used for this baseline.
@@ -636,6 +671,50 @@ if __name__ == "__main__":
         os.replace(temporary_path, checkpoint_path)
         print0(f"saved checkpoint: {checkpoint_path} (next step {next_step})")
 
+    profiler = None
+    if args.profile:
+        profile_dir = os.path.join(args.output_dir, "profile")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        def save_profile_trace(prof):
+            trace_path = os.path.join(profile_dir, f"rank{ddp_rank}_trace.json")
+            table_path = os.path.join(profile_dir, f"rank{ddp_rank}_key_averages.txt")
+            prof.export_chrome_trace(trace_path)
+            with open(table_path, "w") as f:
+                f.write(
+                    prof.key_averages().table(
+                        sort_by="self_cuda_time_total",
+                        row_limit=30,
+                    )
+                )
+                f.write("\n")
+            print0(f"saved profiler trace: {trace_path}")
+            print0(f"saved profiler table: {table_path}")
+
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=args.profile_wait_steps,
+                warmup=args.profile_warmup_steps,
+                active=args.profile_active_steps,
+                repeat=1,
+            ),
+            on_trace_ready=save_profile_trace,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        profiler.start()
+        print0(
+            "profiler enabled: "
+            f"wait={args.profile_wait_steps}, "
+            f"warmup={args.profile_warmup_steps}, "
+            f"active={args.profile_active_steps}"
+        )
+
     for step in range(start_step, args.num_iterations + 1):
         last_step = step == args.num_iterations
 
@@ -719,6 +798,13 @@ if __name__ == "__main__":
 
         if args.save_every > 0 and completed_steps % args.save_every == 0:
             save_checkpoint(completed_steps)
+
+        if profiler is not None:
+            # One profiler step is one complete optimizer update, including accumulation.
+            profiler.step()
+
+    if profiler is not None:
+        profiler.stop()
 
     peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
     total_tokens = args.num_iterations * tokens_per_iter
