@@ -18,6 +18,7 @@ Rules:
 | id | date | commit | change (one line) | hypothesis / expected effect | stage reached | proxy s0 | proxy mean | delta vs baseline | step time | verdict | cost |
 |----|------|--------|-------------------|------------------------------|---------------|----------|------------|-------------------|-----------|---------|------|
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
+| exp001 | 24.7 | pending | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | planned | — | — | — | — | pending | — |
 
 [TODO] Add into table:
 commit; - why we need `id` colomn?
