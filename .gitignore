@@ -9,6 +9,7 @@ notes.md
 AGENTS.md
 DECISIONS.md
 REMOTE_COMMANDS.md
+profiles/**/rank*_trace.json
 .venv*/
 __pycache__/
 .claude/
