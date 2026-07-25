@@ -415,6 +415,19 @@ if __name__ == "__main__":
         default=0,
         help="overwrite the resumable checkpoint every N updates; 0 disables periodic saves",
     )
+    # measurement and run control (neither changes the optimisation itself)
+    parser.add_argument(
+        "--noise_scale_every",
+        type=int,
+        default=0,
+        help="estimate the gradient noise scale every N updates; 0 disables",
+    )
+    parser.add_argument(
+        "--max_updates",
+        type=int,
+        default=0,
+        help="stop cleanly after N optimizer updates; 0 runs the full budget",
+    )
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -448,6 +461,12 @@ if __name__ == "__main__":
     assert args.num_iterations > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
     assert args.save_every >= 0
+    assert args.noise_scale_every >= 0
+    assert args.max_updates >= 0
+    if args.noise_scale_every > 0:
+        assert args.grad_accumulation_steps > 1, (
+            "the noise scale estimator needs at least two micro-batches per update"
+        )
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
     assert args.profile_active_steps > 0
@@ -634,6 +653,35 @@ if __name__ == "__main__":
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return args.learning_rate * decay_ratio
 
+    # --- gradient noise scale (McCandlish et al. 2018, appendix A) -------------
+    # B_simple = tr(Sigma) / |G|^2 is the batch size at which gradient noise
+    # equals gradient signal: below it, doubling the batch nearly doubles the
+    # progress per step; above it, doubling the batch mostly buys nothing.
+    # Both terms come from two batch sizes we already compute for free during
+    # accumulation - one micro-batch, and the full accumulated batch.
+    noise_params = [p for p in base_model.parameters() if p.requires_grad]
+    noise_buffers = None
+    if args.noise_scale_every > 0:
+        noise_buffers = [torch.zeros_like(p) for p in noise_params]
+        buffer_mib = (
+            sum(b.numel() * b.element_size() for b in noise_buffers) // 1024 // 1024
+        )
+        print0(
+            f"noise scale estimator: every {args.noise_scale_every} updates | "
+            f"B_small={B * T * ddp_world_size:,} tokens | "
+            f"B_big={tokens_per_iter:,} tokens | buffer {buffer_mib} MiB"
+        )
+
+    def noise_scale_from(small_sq, big_sq, b_small, b_big):
+        # Unbiased estimates of the true |G|^2 and of tr(Sigma). Either can come
+        # out negative on a noisy step - the ratio is then meaningless, so report
+        # it as None rather than a made-up number.
+        g_sq = (b_big * big_sq - b_small * small_sq) / (b_big - b_small)
+        trace_sigma = (small_sq - big_sq) / (1.0 / b_small - 1.0 / b_big)
+        if g_sq <= 0.0 or trace_sigma <= 0.0:
+            return g_sq, trace_sigma, None
+        return g_sq, trace_sigma, trace_sigma / g_sq
+
     session_wall_start = time.perf_counter()
 
     def elapsed_wall_seconds():
@@ -715,8 +763,17 @@ if __name__ == "__main__":
             f"active={args.profile_active_steps}"
         )
 
-    for step in range(start_step, args.num_iterations + 1):
-        last_step = step == args.num_iterations
+    stop_at_update = args.num_iterations
+    if args.max_updates > 0:
+        stop_at_update = min(stop_at_update, args.max_updates)
+    if stop_at_update != args.num_iterations:
+        print0(
+            f"stopping after {stop_at_update} of {args.num_iterations} updates "
+            "(--max_updates); the LR schedule is still the full-budget one"
+        )
+
+    for step in range(start_step, stop_at_update + 1):
+        last_step = step == stop_at_update
 
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             model.eval()
@@ -748,20 +805,57 @@ if __name__ == "__main__":
         if last_step:
             break
 
+        measure_noise = (
+            args.noise_scale_every > 0 and step % args.noise_scale_every == 0
+        )
+
         torch.cuda.synchronize()
         train_step_start = time.perf_counter()
         model.train()
         train_loss = torch.zeros(1, device=device)
-        for micro_step in range(args.grad_accumulation_steps):
-            model.require_backward_grad_sync = (
-                micro_step == args.grad_accumulation_steps - 1
+        micro_grad_sq = None
+        big_grad_sq = None
+        if measure_noise:
+            # Measurement path. Each micro-batch gradient is kept on its own so
+            # its norm can be read, then the batch-mean gradient is rebuilt by
+            # hand. The optimizer therefore sees exactly the gradient the normal
+            # path would have handed it - this branch does not change training.
+            torch._foreach_zero_(noise_buffers)
+            micro_grad_sq = torch.zeros(
+                args.grad_accumulation_steps, device=device
             )
-            with ctx:
-                _, loss = model(x, y, return_logits=False)
-                loss = loss / args.grad_accumulation_steps
-                train_loss += loss.detach()
-            x, y = train_loader.next_batch()
-            loss.backward()
+            for micro_step in range(args.grad_accumulation_steps):
+                model.require_backward_grad_sync = True
+                optimizer.zero_grad(set_to_none=True)
+                with ctx:
+                    _, loss = model(x, y, return_logits=False)
+                    train_loss += loss.detach() / args.grad_accumulation_steps
+                x, y = train_loader.next_batch()
+                # Note the missing division: this is the gradient of a single
+                # micro-batch mean loss, i.e. one sample at batch size B_small.
+                loss.backward()
+                grads = [p.grad for p in noise_params]
+                micro_grad_sq[micro_step] = (
+                    torch.stack(torch._foreach_norm(grads)).pow(2).sum()
+                )
+                torch._foreach_add_(noise_buffers, grads)
+            torch._foreach_div_(noise_buffers, args.grad_accumulation_steps)
+            big_grad_sq = torch.stack(
+                torch._foreach_norm(noise_buffers)
+            ).pow(2).sum()
+            for p, buf in zip(noise_params, noise_buffers):
+                p.grad.copy_(buf)
+        else:
+            for micro_step in range(args.grad_accumulation_steps):
+                model.require_backward_grad_sync = (
+                    micro_step == args.grad_accumulation_steps - 1
+                )
+                with ctx:
+                    _, loss = model(x, y, return_logits=False)
+                    loss = loss / args.grad_accumulation_steps
+                    train_loss += loss.detach()
+                x, y = train_loader.next_batch()
+                loss.backward()
 
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -786,15 +880,48 @@ if __name__ == "__main__":
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
+            # measurement steps carry the estimator cost, so exclude them from
+            # any timing statistics
+            "noise_scale_measured": measure_noise,
         }
         print0(
-            f"step:{completed_steps}/{args.num_iterations} | loss {lossf:.6f} | "
+            f"step:{completed_steps}/{stop_at_update} | loss {lossf:.6f} | "
             f"lr:{lr:.6g} | train_time:{training_time_ms/1000:.2f}s | "
             f"step:{step_time_ms:.2f}ms"
         )
         log_local(train_record)
         if wandb_run is not None:
             wandb_run.log(train_record)
+
+        if measure_noise:
+            b_small = float(B * T * ddp_world_size)
+            b_big = float(tokens_per_iter)
+            small_sq = micro_grad_sq.mean().item()
+            big_sq = big_grad_sq.item()
+            g_sq, trace_sigma, b_simple = noise_scale_from(
+                small_sq, big_sq, b_small, b_big
+            )
+            noise_record = {
+                "event": "noise_scale",
+                "step": completed_steps,
+                "tokens_seen": tokens_seen,
+                "train_loss": lossf,
+                "b_small_tokens": b_small,
+                "b_big_tokens": b_big,
+                "grad_sq_small": small_sq,
+                "grad_sq_big": big_sq,
+                "grad_sq_true": g_sq,
+                "trace_sigma": trace_sigma,
+                "b_simple_tokens": b_simple,
+            }
+            b_simple_text = "n/a" if b_simple is None else f"{b_simple:,.0f}"
+            print0(
+                f"  noise scale | B_simple:{b_simple_text} tokens | "
+                f"|G|^2:{g_sq:.4g} | tr(Sigma):{trace_sigma:.4g}"
+            )
+            log_local(noise_record)
+            if wandb_run is not None:
+                wandb_run.log(noise_record)
 
         if args.save_every > 0 and completed_steps % args.save_every == 0:
             save_checkpoint(completed_steps)
@@ -807,10 +934,13 @@ if __name__ == "__main__":
         profiler.stop()
 
     peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
-    total_tokens = args.num_iterations * tokens_per_iter
+    total_tokens = stop_at_update * tokens_per_iter
     training_time_seconds = training_time_ms / 1000
     summary = {
-        "status": "complete",
+        "status": (
+            "complete" if stop_at_update == args.num_iterations else "partial"
+        ),
+        "updates_completed": stop_at_update,
         "run_id": run_id,
         "run_name": args.run_name,
         "run_mode": args.run_mode,
@@ -835,7 +965,7 @@ if __name__ == "__main__":
     )
 
     if master_process:
-        save_checkpoint(args.num_iterations)
+        save_checkpoint(stop_at_update)
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
