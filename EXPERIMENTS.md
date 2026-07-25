@@ -20,7 +20,7 @@ Rules:
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
 | exp001 | 24.7 | `e3c9ed0` | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | proxy s0 | 3.56079 | — | **−0.03698** | +0.83% algo overhead | criterion met, but effect decays — do not promote to full yet | ~$0.75 |
 | exp002 | 25.7 | `9185772` | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | measurement, 1788 updates | 3.59701 (baseline reproduction) | — | −0.00077 vs baseline s0 | 4.01s | prediction 1 confirmed, prediction 2 falsified — the baseline is over-batched ~4.9× for 97% of the run | ~$0.75 |
-| exp003 | 25.7 | pending | flat effective batch 16,384 tokens for the whole run (accum=1), LR ∝ √B = 3.182e-4 | proxy s0 = **3.4256** (−0.1722), predicted before the run from the exp002 B_crit curve; see predictions below | planned | — | — | — | — | — | ~$0.75 |
+| exp003 | 25.7 | `6ae36b8` | flat effective batch 16,384 tokens for the whole run (accum=1), LR ∝ √B = 3.182e-4 | proxy s0 = **3.4256** (−0.1722), predicted before the run from the exp002 B_crit curve; see predictions below | planned | — | — | — | — | — | ~$0.75 |
 
 ## exp003 — flat small batch (25.7.2026)
 
