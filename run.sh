@@ -4,8 +4,8 @@ set -euo pipefail
 MODE="${1:-}"
 SEED="${2:-0}"
 OUTPUT_DIR="${3:-}"
-EXPERIMENT_ID="exp001"
-EXPERIMENT_SLUG="batch-ramp"
+EXPERIMENT_ID="exp003"
+EXPERIMENT_SLUG="flat-small-batch"
 
 if [[ -z "$MODE" ]]; then
   echo "usage: $0 {smoke|proxy|full} [seed] [output_dir] [extra train_gpt2.py args...]" >&2
@@ -71,8 +71,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --model d12 \
   --batch_size 16 \
   --grad_accumulation_steps 32 \
-  --batch_ramp_start_accumulation_steps 8 \
-  --batch_ramp_fraction 0.5 \
+  --flat_accumulation_steps 1 \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \

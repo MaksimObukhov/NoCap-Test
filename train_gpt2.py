@@ -378,6 +378,16 @@ if __name__ == "__main__":
         help="final number of gradient accumulation steps",
     )
     parser.add_argument(
+        "--flat_accumulation_steps",
+        type=int,
+        default=0,
+        help=(
+            "hold accumulation at this many microbatches for the whole run; "
+            "--grad_accumulation_steps stays the budget unit and the LR "
+            "reference batch. 0 disables"
+        ),
+    )
+    parser.add_argument(
         "--batch_ramp_start_accumulation_steps",
         type=int,
         default=0,
@@ -466,8 +476,17 @@ if __name__ == "__main__":
     assert args.num_iterations > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
     assert args.grad_accumulation_steps > 0
+    assert args.flat_accumulation_steps >= 0
     assert args.batch_ramp_start_accumulation_steps >= 0
     assert 0.0 <= args.batch_ramp_fraction <= 1.0
+    if args.flat_accumulation_steps > 0:
+        assert args.batch_ramp_start_accumulation_steps == 0, (
+            "--flat_accumulation_steps and --batch_ramp_start_accumulation_steps "
+            "are mutually exclusive"
+        )
+        assert (
+            args.flat_accumulation_steps <= args.grad_accumulation_steps
+        ), "--flat_accumulation_steps is a smaller batch than the budget unit"
     if args.batch_ramp_start_accumulation_steps == 0:
         assert args.batch_ramp_fraction == 0.0, (
             "--batch_ramp_fraction requires "
@@ -504,8 +523,11 @@ if __name__ == "__main__":
         assert (
             args.batch_ramp_start_accumulation_steps % ddp_world_size == 0
         )
+    if args.flat_accumulation_steps > 0:
+        assert args.flat_accumulation_steps % ddp_world_size == 0
     args.grad_accumulation_steps //= ddp_world_size
     args.batch_ramp_start_accumulation_steps //= ddp_world_size
+    args.flat_accumulation_steps //= ddp_world_size
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0
@@ -526,6 +548,7 @@ if __name__ == "__main__":
             "model",
             "batch_size",
             "grad_accumulation_steps",
+            "flat_accumulation_steps",
             "batch_ramp_start_accumulation_steps",
             "batch_ramp_fraction",
             "sequence_length",
@@ -537,6 +560,7 @@ if __name__ == "__main__":
         )
         for key in resume_keys:
             if key in {
+                "flat_accumulation_steps",
                 "batch_ramp_start_accumulation_steps",
                 "batch_ramp_fraction",
             }:
@@ -637,6 +661,14 @@ if __name__ == "__main__":
             f"{ramp_start_accumulation} -> {args.grad_accumulation_steps} "
             f"microbatches over first {args.batch_ramp_fraction:.1%} of tokens"
         )
+    if args.flat_accumulation_steps > 0:
+        flat_tokens = args.flat_accumulation_steps * micro_batch_tokens
+        print0(
+            f"flat batch: {args.flat_accumulation_steps} microbatches = "
+            f"{flat_tokens:,} tokens for the whole run | "
+            f"{target_tokens // flat_tokens:,} optimizer updates | "
+            f"lr scale {math.sqrt(flat_tokens / final_tokens_per_update):.4f}"
+        )
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -707,6 +739,11 @@ if __name__ == "__main__":
         x, y = train_loader.next_batch()
 
     def accumulation_steps_at(current_tokens):
+        # A flat batch decouples the accumulation actually performed from
+        # --grad_accumulation_steps, which stays the unit the token budget and
+        # the LR reference batch are expressed in.
+        if args.flat_accumulation_steps > 0:
+            return args.flat_accumulation_steps
         if ramp_start_accumulation == args.grad_accumulation_steps:
             return args.grad_accumulation_steps
         if current_tokens >= ramp_tokens:
