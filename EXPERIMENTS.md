@@ -19,7 +19,7 @@ Rules:
 |----|------|--------|-------------------|------------------------------|---------------|----------|------------|-------------------|-----------|---------|------|
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
 | exp001 | 24.7 | `e3c9ed0` | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | proxy s0 | 3.56079 | — | **−0.03698** | +0.83% algo overhead | criterion met, but effect decays — do not promote to full yet | ~$0.75 |
-| exp002 | 25.7 | pending | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | planned | n/a (measurement) | — | — | — | pending | ~$0.25 |
+| exp002 | 25.7 | `9185772` | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | measurement, 1788 updates | 3.59701 (baseline reproduction) | — | −0.00077 vs baseline s0 | 4.01s | prediction 1 confirmed, prediction 2 falsified — the baseline is over-batched ~4.9× for 97% of the run | ~$0.75 |
 
 ## exp002 — gradient noise scale measurement (25.7.2026)
 
@@ -54,7 +54,55 @@ If (1) is false — `B_simple` already near or above 524,288 at the start — th
 
 Two things follow. Any paired single-seed comparison against a baseline recorded on a *different* instance carries this floor, which should be of the same order as the 0.0018 seed-to-seed sigma — the 1788-update run tests this directly, since its final val loss should land within roughly ±0.004 of 3.59777. And exp001's −0.03698 is unaffected: it was also measured across cards, but the effect is ~20× the floor.
 
-**Cost.** ~400 updates ≈ 30 min plus a 50-update A/A gate ≈ 5 min, single 4090 ≈ $0.25.
+**Cost.** Extended to the full 1788-update proxy length before launching, because a 400-update run only reaches 0.21B tokens and the crossing point might sit beyond that. 2.1 h, single 4090, ≈ $0.75. Artifacts: `nocap-runs-backup/exp002-noise-scale` (commit `fdb13df` on `exp002/noise-scale`).
+
+### Result (25.7.2026)
+
+Run completed all 1788 updates from a clean tree (`git_dirty: false`), 112 measurement steps, and every one of them produced a usable estimate — no negative variance or signal terms, so the estimator is well conditioned on this problem.
+
+**In plain terms: the baseline trains with a batch about five times larger than it needs, and it does so for essentially the whole run.**
+
+| what we measured | number |
+|---|---|
+| B_crit at the very first update | **3,283 tokens** — 160× smaller than the baseline's 524,288 |
+| B_crit through mid-training (0.1–0.7B tokens) | ~106,000 tokens — the baseline is running **4.9× larger** |
+| where B_crit finally reaches 524,288 | **~910M tokens = 97% of the proxy budget** |
+| final val loss | 3.597008 vs baseline 3.597773 (−0.00077) |
+
+Against the three predictions written before the run:
+
+1. **Confirmed, and then some.** B_crit early is 3,283 tokens, an order of magnitude below even the 10⁴ end of the predicted range. The early phase is not mildly over-batched, it is over-batched by more than two orders of magnitude.
+2. **Falsified.** The crossing was predicted before 50% of the budget; it happens at 97%. The reasoning behind the prediction was simply wrong — B_crit does not climb fast enough to meet 524,288 mid-run, it sits 4–8× below it almost the whole way.
+3. **Confirmed.** Growth is monotonic under smoothing; individual points swing by up to 3× as expected from a ratio of two quantities estimated from 32 samples.
+
+**Why the falsified prediction is the valuable one.** The crossing point bounds how much this whole direction can win, because the baseline only overpays where B_crit is below its batch. Predicting a crossing at 50% meant the direction was capped at a few percent and should be dropped. Measuring it at 97% means nearly the entire budget is overpaid, and the direction is the most valuable one on the board.
+
+**Predicted token savings** (`ceiling_from_noise_scale.py`, integrating cost ∝ `B + B_crit` over the measured curve, with the model calibrated against exp001's measured 1.06× — the raw model overstates gains by 2.9× on this problem):
+
+| schedule | calibrated token saving |
+|---|---|
+| accum=1 flat (16,384 tokens) | **53.6%** |
+| track B_crit exactly | 33.3% |
+| 16k → 524k ramped over 97% | 17.0% |
+| 16k → 524k ramped over 90% | 15.4% |
+| exp001 as run | 6% (measured) |
+
+**This retires the ramp idea.** Token cost goes as `B + B_crit`, which falls monotonically as B falls — there is no interior optimum, so a flat small batch beats any ramp, and beats even tracking B_crit exactly (at `B = B_crit` you pay `2·B_crit`; at `B → 0` you pay `B_crit`). A ramp loses simply because it spends most of its time at a large batch. The GPT-3-style ramp premise behind exp001 is not what this problem wants.
+
+So the measurement's real payoff was not "derive the schedule" — the derived schedule is trivially "as small as overhead allows". It was sizing the prize: 4.9× over-batched for 97% of the run.
+
+**Caveats, in order of how much they could matter.**
+1. The estimator uses raw gradients, but AdamW is adaptive, and McCandlish notes the relevant noise scale for an adaptive optimizer should be computed on the preconditioned gradient. The measured B_crit may be systematically biased for this optimizer.
+2. The calibration factor of 2.9× comes from a 6% effect at a 1.6× batch change, and is being applied to a 32× batch change. Treat the savings table as an ordering, not a forecast.
+3. Adam's `β1=0.9, β2=0.95` are timescales in *steps*, not tokens. At accum=1 the run does 57,216 updates instead of 1,788, so the second-moment estimate averages over 32× less data. The model cannot see this, and it is the most likely way an aggressive schedule fails.
+4. The sharp rise at the end (150k → 2.26M over the last 15%) coincides with warmdown: near the schedule's minimum `|G|²` shrinks while `tr(Σ)` does not, so the ratio climbs. This is a real effect — the end of training genuinely wants a large batch — but it means the 97% crossing is partly a warmdown artefact and should not be read as "the batch was only correct at the very end".
+
+**Side results.**
+- Final val loss landed 0.00077 from the baseline on a different rented card, i.e. the cross-instance reproducibility floor is roughly half the 0.0018 seed-to-seed sigma. Single-seed paired comparisons across instances stay valid, and exp001's −0.037 is ~48× this floor.
+- Measurement overhead: peak VRAM 10,777 MiB against the baseline's 9,821 (the fp32 gradient buffer), throughput 129,744 tok/s.
+- Operational: the instance auto-stopped as designed, then its GPU was rented away before the files were fetched, which on Vast blocks a restart for hours to weeks. W&B held the full record and `pull_from_wandb.py` rebuilt the local files exactly. Fetch before stopping, or treat W&B as the real backup.
+
+**Next.** exp003 should test a *flat small batch*, not a ramp. Recommended starting point is accum=4 (65,536 tokens) rather than accum=1: mid-training B_crit is 106,000, so accum=4 is already below the noise scale and inside the target regime, capturing roughly 71% of the modelled benefit at a quarter of the extra optimizer steps — and therefore a quarter of the exposure to caveat 3.
 
 ## exp001 — batch ramp, proxy seed 0 (24.7.2026)
 
