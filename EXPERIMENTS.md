@@ -20,7 +20,7 @@ Rules:
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
 | exp001 | 24.7 | `e3c9ed0` | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | proxy s0 | 3.56079 | — | **−0.03698** | +0.83% algo overhead | criterion met, but effect decays — do not promote to full yet | ~$0.75 |
 | exp002 | 25.7 | `9185772` | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | measurement, 1788 updates | 3.59701 (baseline reproduction) | — | −0.00077 vs baseline s0 | 4.01s | prediction 1 confirmed, prediction 2 falsified — the baseline is over-batched ~4.9× for 97% of the run | ~$0.75 |
-| exp003 | 25.7 | `6ae36b8` | flat effective batch 16,384 tokens for the whole run (accum=1), LR ∝ √B = 3.182e-4 | proxy s0 = **3.4256** (−0.1722), predicted before the run from the exp002 B_crit curve; see predictions below | planned | — | — | — | — | — | ~$0.75 |
+| exp003 | 25.7 | `6ae36b8` | flat effective batch 16,384 tokens for the whole run (accum=1), LR ∝ √B = 3.182e-4 | proxy s0 = **3.4256** (−0.1722), predicted before the run from the exp002 B_crit curve; see predictions below | proxy s0, stopped at 22% of budget | — (stopped) | — | −0.3847 @ 21.5%, extrapolates to −0.05…−0.13 at 100% | +17.6% algo overhead | direction works but is a hyperparameter, not an algorithm — closed by scope, see below | ~$0.35 |
 
 ## exp003 — flat small batch (25.7.2026)
 
@@ -64,6 +64,41 @@ Token saving converts to loss through the schedule family's own slope, 0.1555 na
 **Known caveats, unchanged from exp002.** B_crit was measured on raw gradients while AdamW is adaptive, so the curve may be systematically biased for this optimizer. β1=0.9 / β2=0.95 are timescales in steps: at accum=1 the β2 window covers 327,680 tokens instead of 10,485,760, and β2=0.95 is a large-batch convention in the first place. The token-indexed loop does put warmup on tokens (50.3M ⇒ 3,072 updates of warmup at accum=1), so the moment estimates are at least not being asked to converge in 96 steps.
 
 **Cost.** Straight to proxy seed 0, smoke skipped by decision: 2.1 h + ~4% overhead, single 4090, ≈ $0.75. Skipping smoke trades a $0.25 insurance premium against a $0.75 exposure; accepted because there is no clipping, the LR coupling is the one already validated in exp001, and neither model nor data changed.
+
+### Result — stopped at 22% of budget (25.7.2026)
+
+**Stopped deliberately, not because it was failing.** Re-reading the README mid-run settled a scope question that should have been settled before exp001: the challenge explicitly does not want hyperparameter work ("We're not here to optimize learning rates and torch.compile flags"; the *not expected to* list names LR bumps, hyperparameter magic, and grid-searching Adam betas). Its Technical Notes go further and treat batch size and gradient accumulation as the knobs you turn to fit your GPU. However carefully exp003's batch was derived from measurement, the deliverable reads as "effective batch 16,384 instead of 524,288, LR × √B" — a hyperparameter. The run was killed at update ~12,810 and the record reconstructed from W&B by `pull_from_wandb.py` (`nocap-runs-backup/exp003-flat-small-batch`, W&B state `killed`).
+
+**What the partial run does establish.** Four validations landed before the stop, against the baseline at identical token counts:
+
+| tokens | % of budget | exp003 val | baseline val | Δ |
+|---|---|---|---|---|
+| 0 | 0% | 10.9418 | 10.9418 | 0.0000 |
+| 67,108,864 | 7.2% | 4.9915 | 5.9149 | **−0.9234** |
+| 134,217,728 | 14.3% | 4.4403 | 5.1016 | −0.6613 |
+| 201,326,592 | 21.5% | 4.2709 | 4.6557 | −0.3847 |
+
+Against the five pre-registered predictions:
+
+1. **Point prediction — untestable, but trending below the bet interval.** A power law fit through the three non-trivial Δ points extrapolates to Δ(100%) ≈ 0.13; fit through the last two only (the decay is steepening, exponent −0.76 → −1.34) gives ≈ 0.05. Both sit at or under the low end of the −0.08…−0.17 interval, and the honest reading is the pessimistic one, since exp001 established that this decay keeps accelerating. **The 2.9× calibration factor still overstated the effect.**
+2. **Retention — not measurable, but the early decay already argues against it.** Δ halved between 7.2% and 21.5% while the intervention was still fully active. exp001's decay was blamed on the ramp ending; here nothing ends, and it decays anyway. That weakens the exp001 explanation independently of where exp003 would have finished.
+3. **Stability — confirmed as "no divergence", falsified as a number.** No NaN, no blowup. Update-to-update train-loss std over the last 500 updates was 0.1816 vs the baseline's 0.0866 — ×2.1, not the predicted ×5.7. Small-batch noise does not propagate to the loss as 1/√B here.
+4. **Wall-clock overhead — badly missed. +17.6%, predicted +4.1%.** 1,927.0 s of train time over 12,810 updates = 150.4 ms per micro-batch, against the baseline's 128.3 ms (4,106 ms / 32). The two-point fit of C ≈ 5.3 ms from accum=8→32 does not extrapolate to accum=1; the real fixed cost per optimizer update is ~22 ms. This was flagged before the run as the prediction most likely to be off, and it was.
+5. **Falsifier — not reached.** The run never produced a final val loss, so the Adam-timescale ceiling was neither confirmed nor ruled out.
+
+**Net effect, priced properly.** Converting through the schedule-family slope of 0.1555 nats per doubling, and paying the *measured* 17.6% overhead:
+
+| Δ at 100% | token saving | wall-clock vs baseline |
+|---|---|---|
+| 0.05 (pessimistic fit) | 20.0% | −5.6% |
+| 0.11 | 38.8% | −27.7% |
+| 0.1722 (predicted) | 53.6% | −45.2% |
+
+So the direction is real but the plausible band is wide and its floor is nearly nothing — and this is a *proxy* number, which exp001 showed systematically overstates early-phase interventions on the full budget. A −5.6% full-run result built on a hyperparameter is not what the challenge is asking for.
+
+**Verdict: closed by scope, not by failure.** The measurement stands (the baseline genuinely is ~4.9× over-batched for 97% of the run), the intervention genuinely helps, and it is still a hyperparameter. Budget moves to an algorithmic change. exp004 is multi-token prediction heads — explicitly on the README's suggested list, and in the same family as both entries that currently beat the baseline on the leaderboard.
+
+**Carried forward into `IDEA.md`.** Worth writing up as a scoped-out negative result: the noise scale was measured rather than guessed, the ceiling was sized before spending, and the direction was dropped once it was clear what class of change it belonged to. The two reusable facts for later runs are the measured per-update fixed cost (~22 ms, i.e. small batches are not free) and the decay behaviour of early-phase interventions.
 
 ## exp002 — gradient noise scale measurement (25.7.2026)
 
