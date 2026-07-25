@@ -4,6 +4,8 @@ set -euo pipefail
 MODE="${1:-}"
 SEED="${2:-0}"
 OUTPUT_DIR="${3:-}"
+EXPERIMENT_ID="exp001"
+EXPERIMENT_SLUG="batch-ramp"
 
 if [[ -z "$MODE" ]]; then
   echo "usage: $0 {smoke|proxy|full} [seed] [output_dir] [extra train_gpt2.py args...]" >&2
@@ -43,19 +45,17 @@ esac
 
 if [[ -z "$OUTPUT_DIR" ]]; then
   RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-  OUTPUT_DIR="runs/manual-${RUN_TIMESTAMP}/${MODE}-seed-${SEED}"
+  OUTPUT_DIR="runs/${EXPERIMENT_ID}-${EXPERIMENT_SLUG}-${RUN_TIMESTAMP}/${MODE}-seed-${SEED}"
 fi
 
-RUN_NAME="${MODE}-seed-${SEED}"
+RUN_NAME="${EXPERIMENT_ID}-${EXPERIMENT_SLUG}-${MODE}-seed-${SEED}"
 WANDB_ARGS=()
 if [[ "${WANDB_ENABLED:-1}" == "1" ]]; then
   WANDB_ARGS+=(
     --log_wandb
     --wandb_project "${WANDB_PROJECT:-nocap-baseline}"
   )
-  if [[ -n "${WANDB_GROUP:-}" ]]; then
-    WANDB_ARGS+=(--wandb_group "$WANDB_GROUP")
-  fi
+  WANDB_ARGS+=(--wandb_group "${WANDB_GROUP:-${EXPERIMENT_ID}-${EXPERIMENT_SLUG}}")
 fi
 
 mkdir -p "$OUTPUT_DIR"
@@ -71,6 +71,8 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --model d12 \
   --batch_size 16 \
   --grad_accumulation_steps 32 \
+  --batch_ramp_start_accumulation_steps 8 \
+  --batch_ramp_fraction 0.5 \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \
