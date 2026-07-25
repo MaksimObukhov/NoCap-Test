@@ -30,6 +30,31 @@ else
   echo "WARNING: uv is not installed; use uv for dependency changes." >&2
 fi
 
+echo
+echo "python packages:"
+IMPORT_NAMES=(wandb huggingface_hub)
+PACKAGE_SPECS=(wandb==0.19.9 huggingface-hub==0.30.2)
+MISSING_SPECS=()
+for package_index in "${!IMPORT_NAMES[@]}"; do
+  import_name="${IMPORT_NAMES[$package_index]}"
+  if "$PYTHON_BIN" -c "import ${import_name}" >/dev/null 2>&1; then
+    echo "  ${import_name}: present"
+  else
+    echo "  ${import_name}: missing"
+    MISSING_SPECS+=("${PACKAGE_SPECS[$package_index]}")
+  fi
+done
+
+if (( ${#MISSING_SPECS[@]} > 0 )); then
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: missing packages (${MISSING_SPECS[*]}) and uv is not installed." >&2
+    exit 1
+  fi
+  echo "  installing: ${MISSING_SPECS[*]}"
+  uv pip install --python "$PYTHON_BIN" "${MISSING_SPECS[@]}"
+fi
+
+echo
 echo "repository:"
 git -C "$REPO_ROOT" status --short --branch
 git -C "$REPO_ROOT" log -1 --oneline
