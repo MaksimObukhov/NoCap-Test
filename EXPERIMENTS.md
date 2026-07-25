@@ -50,6 +50,10 @@ If (1) is false — `B_simple` already near or above 524,288 at the start — th
 
 **Success criterion.** Not a loss number. The run succeeds if it produces a `B_simple(tokens)` curve whose smoothed trend is stable enough to read a crossing point off it. That crossing point then parameterises any future batch ramp, and the same instrumentation is reusable for the sequence-length curriculum.
 
+**Cross-instance reproducibility floor (found by the A/A gate, 25.7.2026).** The instrumented binary with measurement disabled does *not* reproduce the baseline bitwise on a different rented card. The first update differs by 0.35 ulp — the smallest representable non-zero difference, from a different cuBLAS reduction order — and training amplifies it roughly tenfold every ten updates, reaching 0.059 by step 47. The sign stays balanced (43% positive) and the deviation stays at 1.03× the baseline's own step-to-step jitter, so this is chaos, not a code change.
+
+Two things follow. Any paired single-seed comparison against a baseline recorded on a *different* instance carries this floor, which should be of the same order as the 0.0018 seed-to-seed sigma — the 1788-update run tests this directly, since its final val loss should land within roughly ±0.004 of 3.59777. And exp001's −0.03698 is unaffected: it was also measured across cards, but the effect is ~20× the floor.
+
 **Cost.** ~400 updates ≈ 30 min plus a 50-update A/A gate ≈ 5 min, single 4090 ≈ $0.25.
 
 ## exp001 — batch ramp, proxy seed 0 (24.7.2026)
