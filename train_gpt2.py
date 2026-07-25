@@ -102,8 +102,8 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -375,28 +375,46 @@ if __name__ == "__main__":
         "--grad_accumulation_steps",
         type=int,
         default=1,
-        help="number of gradient accumulation steps",
+        help="final number of gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--batch_ramp_start_accumulation_steps",
+        type=int,
+        default=0,
+        help="initial accumulation steps; 0 disables batch ramp",
+    )
+    parser.add_argument(
+        "--batch_ramp_fraction",
+        type=float,
+        default=0.0,
+        help="fraction of training tokens over which effective batch grows linearly",
     )
     parser.add_argument(
         "--sequence_length", type=int, default=64, help="sequence length"
     )
     parser.add_argument("--seed", type=int, default=0)
-    # workload (number of steps)
+    # workload (baseline-equivalent updates; fixes the token budget)
     parser.add_argument(
-        "--num_iterations", type=int, default=10, help="number of optimizer updates"
+        "--num_iterations",
+        type=int,
+        default=10,
+        help="target tokens expressed as updates at the final effective batch",
     )
     # optimization
     parser.add_argument(
         "--learning_rate", type=float, default=1e-4, help="peak learning rate"
     )
     parser.add_argument(
-        "--warmup_iters", type=int, default=0, help="learning rate warmup iterations"
+        "--warmup_iters",
+        type=int,
+        default=0,
+        help="warmup tokens expressed as updates at the final effective batch",
     )
     parser.add_argument(
         "--warmdown_iters",
         type=int,
         default=0,
-        help="learning rate warmdown iterations",
+        help="warmdown tokens expressed as updates at the final effective batch",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation and persistence
@@ -404,7 +422,7 @@ if __name__ == "__main__":
         "--val_loss_every",
         type=int,
         default=0,
-        help="evaluate validation loss every N optimizer updates",
+        help="validate every N final-batch-equivalent updates",
     )
     parser.add_argument(
         "--val_batch_size", type=int, default=16, help="validation batch size"
@@ -413,7 +431,7 @@ if __name__ == "__main__":
         "--save_every",
         type=int,
         default=0,
-        help="overwrite the resumable checkpoint every N updates; 0 disables periodic saves",
+        help="checkpoint every N final-batch-equivalent updates; 0 disables",
     )
     parser.add_argument(
         "--skip_final_checkpoint",
@@ -452,6 +470,20 @@ if __name__ == "__main__":
     assert args.model in {"d12", "d24", "d36", "d48"}
     assert args.num_iterations > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
+    assert args.grad_accumulation_steps > 0
+    assert args.batch_ramp_start_accumulation_steps >= 0
+    assert 0.0 <= args.batch_ramp_fraction <= 1.0
+    if args.batch_ramp_start_accumulation_steps == 0:
+        assert args.batch_ramp_fraction == 0.0, (
+            "--batch_ramp_fraction requires "
+            "--batch_ramp_start_accumulation_steps"
+        )
+    else:
+        assert args.batch_ramp_fraction > 0.0
+        assert (
+            args.batch_ramp_start_accumulation_steps
+            <= args.grad_accumulation_steps
+        ), "batch ramp must grow toward --grad_accumulation_steps"
     assert args.save_every >= 0
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
@@ -473,7 +505,12 @@ if __name__ == "__main__":
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     assert args.grad_accumulation_steps % ddp_world_size == 0
+    if args.batch_ramp_start_accumulation_steps > 0:
+        assert (
+            args.batch_ramp_start_accumulation_steps % ddp_world_size == 0
+        )
     args.grad_accumulation_steps //= ddp_world_size
+    args.batch_ramp_start_accumulation_steps //= ddp_world_size
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0
@@ -494,6 +531,8 @@ if __name__ == "__main__":
             "model",
             "batch_size",
             "grad_accumulation_steps",
+            "batch_ramp_start_accumulation_steps",
+            "batch_ramp_fraction",
             "sequence_length",
             "num_iterations",
             "learning_rate",
@@ -502,7 +541,14 @@ if __name__ == "__main__":
             "weight_decay",
         )
         for key in resume_keys:
-            if resume_checkpoint["args"][key] != getattr(args, key):
+            if key in {
+                "batch_ramp_start_accumulation_steps",
+                "batch_ramp_fraction",
+            }:
+                checkpoint_value = resume_checkpoint["args"].get(key, 0)
+            else:
+                checkpoint_value = resume_checkpoint["args"][key]
+            if checkpoint_value != getattr(args, key):
                 raise ValueError(f"resume checkpoint does not match --{key}")
 
     run_id = (
@@ -572,8 +618,30 @@ if __name__ == "__main__":
     print0(f"using device: {device} ({metadata['gpu_name']})")
     print0(f"run: {args.run_name} | seed: {args.seed} | output: {args.output_dir}")
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
-    print0(f"tokens per iteration: {tokens_per_iter:,}")
+    micro_batch_tokens = B * T * ddp_world_size
+    final_tokens_per_update = micro_batch_tokens * args.grad_accumulation_steps
+    target_tokens = args.num_iterations * final_tokens_per_update
+    warmup_tokens = args.warmup_iters * final_tokens_per_update
+    warmdown_tokens = args.warmdown_iters * final_tokens_per_update
+    validation_interval_tokens = args.val_loss_every * final_tokens_per_update
+    save_interval_tokens = args.save_every * final_tokens_per_update
+    ramp_start_accumulation = (
+        args.batch_ramp_start_accumulation_steps
+        or args.grad_accumulation_steps
+    )
+    ramp_tokens = int(target_tokens * args.batch_ramp_fraction)
+    assert target_tokens % micro_batch_tokens == 0
+    print0(
+        f"token budget: {target_tokens:,} | "
+        f"microbatch: {micro_batch_tokens:,} tokens | "
+        f"final effective batch: {final_tokens_per_update:,} tokens"
+    )
+    if ramp_start_accumulation != args.grad_accumulation_steps:
+        print0(
+            "batch ramp: "
+            f"{ramp_start_accumulation} -> {args.grad_accumulation_steps} "
+            f"microbatches over first {args.batch_ramp_fraction:.1%} of tokens"
+        )
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -609,7 +677,9 @@ if __name__ == "__main__":
         device_type=device,
     )
 
-    start_step = 0
+    completed_steps = 0
+    tokens_seen = 0
+    last_validation_tokens = -1
     training_time_ms = 0.0
     previous_wall_time_seconds = 0.0
     final_val_loss = None
@@ -618,7 +688,15 @@ if __name__ == "__main__":
         train_loader.load_state_dict(resume_checkpoint["train_loader"])
         x = resume_checkpoint["next_x"].to(device)
         y = resume_checkpoint["next_y"].to(device)
-        start_step = resume_checkpoint["next_step"]
+        completed_steps = resume_checkpoint["next_step"]
+        tokens_seen = resume_checkpoint.get(
+            "tokens_seen",
+            completed_steps * final_tokens_per_update,
+        )
+        last_validation_tokens = resume_checkpoint.get(
+            "last_validation_tokens",
+            tokens_seen,
+        )
         training_time_ms = resume_checkpoint["training_time_ms"]
         previous_wall_time_seconds = resume_checkpoint.get("wall_time_seconds", 0.0)
         final_val_loss = resume_checkpoint.get("last_val_loss")
@@ -626,18 +704,35 @@ if __name__ == "__main__":
         np.random.set_state(resume_checkpoint["rng_state"]["numpy"])
         torch.set_rng_state(resume_checkpoint["rng_state"]["torch"])
         torch.cuda.set_rng_state_all(resume_checkpoint["rng_state"]["cuda"])
-        print0(f"resuming from completed step {start_step}")
+        print0(
+            f"resuming from completed update {completed_steps} "
+            f"at {tokens_seen:,} tokens"
+        )
     else:
         x, y = train_loader.next_batch()
 
-    def get_lr(it):
-        assert it < args.num_iterations
-        if it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
-        if it < args.num_iterations - args.warmdown_iters:
+    def accumulation_steps_at(current_tokens):
+        if ramp_start_accumulation == args.grad_accumulation_steps:
+            return args.grad_accumulation_steps
+        if current_tokens >= ramp_tokens:
+            return args.grad_accumulation_steps
+        progress = current_tokens / ramp_tokens
+        accumulation = ramp_start_accumulation + progress * (
+            args.grad_accumulation_steps - ramp_start_accumulation
+        )
+        return math.floor(accumulation + 0.5)
+
+    def base_lr_at(current_tokens, update_tokens):
+        if current_tokens < warmup_tokens:
+            return args.learning_rate * min(
+                (current_tokens + update_tokens) / warmup_tokens,
+                1.0,
+            )
+        if current_tokens < target_tokens - warmdown_tokens:
             return args.learning_rate
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return args.learning_rate * decay_ratio
+        return args.learning_rate * (
+            (target_tokens - current_tokens) / warmdown_tokens
+        )
 
     session_wall_start = time.perf_counter()
 
@@ -648,12 +743,14 @@ if __name__ == "__main__":
         if not master_process:
             return
         checkpoint = {
-            "version": 1,
+            "version": 2,
             "run_id": run_id,
             "wandb_run_id": wandb_run_id,
             "model": base_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "next_step": next_step,
+            "tokens_seen": tokens_seen,
+            "last_validation_tokens": last_validation_tokens,
             "train_loader": train_loader.state_dict(),
             # The loader cursor is already beyond this prefetched batch.
             "next_x": x.cpu(),
@@ -720,10 +817,20 @@ if __name__ == "__main__":
             f"active={args.profile_active_steps}"
         )
 
-    for step in range(start_step, args.num_iterations + 1):
-        last_step = step == args.num_iterations
+    while True:
+        assert tokens_seen <= target_tokens
+        last_step = tokens_seen == target_tokens
+        validation_due = (
+            args.val_loss_every > 0
+            and (
+                last_validation_tokens < 0
+                or tokens_seen // validation_interval_tokens
+                > last_validation_tokens // validation_interval_tokens
+                or last_step
+            )
+        )
 
-        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
+        if validation_due:
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -737,38 +844,56 @@ if __name__ == "__main__":
             final_val_loss = val_loss.item()
             validation_record = {
                 "event": "validation",
-                "step": step,
-                "tokens_seen": step * tokens_per_iter,
+                "step": completed_steps,
+                "tokens_seen": tokens_seen,
                 "val_loss": final_val_loss,
                 "training_time_seconds": training_time_ms / 1000,
                 "wall_time_seconds": elapsed_wall_seconds(),
             }
             print0(
-                f"step:{step}/{args.num_iterations} | val loss {final_val_loss:.6f}"
+                f"update:{completed_steps} | tokens:{tokens_seen:,}/"
+                f"{target_tokens:,} | val loss {final_val_loss:.6f}"
             )
             log_local(validation_record)
             if wandb_run is not None:
                 wandb_run.log(validation_record)
+            last_validation_tokens = tokens_seen
 
         if last_step:
             break
+
+        remaining_microbatches = (
+            target_tokens - tokens_seen
+        ) // micro_batch_tokens
+        current_accumulation_steps = min(
+            accumulation_steps_at(tokens_seen),
+            remaining_microbatches,
+        )
+        update_tokens = current_accumulation_steps * micro_batch_tokens
+        batch_ratio = update_tokens / final_tokens_per_update
 
         torch.cuda.synchronize()
         train_step_start = time.perf_counter()
         model.train()
         train_loss = torch.zeros(1, device=device)
-        for micro_step in range(args.grad_accumulation_steps):
+        for micro_step in range(current_accumulation_steps):
             model.require_backward_grad_sync = (
-                micro_step == args.grad_accumulation_steps - 1
+                micro_step == current_accumulation_steps - 1
             )
             with ctx:
                 _, loss = model(x, y, return_logits=False)
-                loss = loss / args.grad_accumulation_steps
+                # Each microbatch loss is a mean. Dividing by the current number
+                # of microbatches makes the accumulated gradient a batch mean too.
+                loss = loss / current_accumulation_steps
                 train_loss += loss.detach()
             x, y = train_loader.next_batch()
             loss.backward()
 
-        lr = get_lr(step)
+        base_lr = base_lr_at(tokens_seen, update_tokens)
+        # Gradient-noise std scales approximately as 1/sqrt(batch). Scaling LR
+        # as sqrt(batch) keeps the noisy part of the parameter update comparable.
+        lr_batch_scale = math.sqrt(batch_ratio)
+        lr = base_lr * lr_batch_scale
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.step()
@@ -779,29 +904,39 @@ if __name__ == "__main__":
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()
-        completed_steps = step + 1
-        tokens_seen = completed_steps * tokens_per_iter
+        previous_tokens_seen = tokens_seen
+        tokens_seen += update_tokens
+        completed_steps += 1
         train_record = {
             "event": "train",
             "step": completed_steps,
             "tokens_seen": tokens_seen,
             "train_loss": lossf,
+            "base_learning_rate": base_lr,
             "learning_rate": lr,
+            "lr_batch_scale": lr_batch_scale,
+            "grad_accumulation_steps": current_accumulation_steps,
+            "effective_batch_tokens": update_tokens,
             "step_time_ms": step_time_ms,
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
         }
         print0(
-            f"step:{completed_steps}/{args.num_iterations} | loss {lossf:.6f} | "
-            f"lr:{lr:.6g} | train_time:{training_time_ms/1000:.2f}s | "
-            f"step:{step_time_ms:.2f}ms"
+            f"update:{completed_steps} | tokens:{tokens_seen:,}/{target_tokens:,} | "
+            f"batch:{update_tokens:,} | loss {lossf:.6f} | lr:{lr:.6g} | "
+            f"train_time:{training_time_ms/1000:.2f}s | step:{step_time_ms:.2f}ms"
         )
         log_local(train_record)
         if wandb_run is not None:
             wandb_run.log(train_record)
 
-        if args.save_every > 0 and completed_steps % args.save_every == 0:
+        crossed_save_boundary = (
+            args.save_every > 0
+            and tokens_seen // save_interval_tokens
+            > previous_tokens_seen // save_interval_tokens
+        )
+        if crossed_save_boundary:
             save_checkpoint(completed_steps)
 
         if profiler is not None:
@@ -812,7 +947,6 @@ if __name__ == "__main__":
         profiler.stop()
 
     peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
-    total_tokens = args.num_iterations * tokens_per_iter
     training_time_seconds = training_time_ms / 1000
     summary = {
         "status": "complete",
@@ -825,23 +959,26 @@ if __name__ == "__main__":
         "gpu_name": metadata["gpu_name"],
         "final_val_loss": final_val_loss,
         "num_iterations": args.num_iterations,
-        "tokens_seen": total_tokens,
+        "optimizer_updates": completed_steps,
+        "target_tokens": target_tokens,
+        "tokens_seen": tokens_seen,
         "training_time_seconds": training_time_seconds,
         "wall_time_seconds": elapsed_wall_seconds(),
-        "tokens_per_second": total_tokens / training_time_seconds,
+        "tokens_per_second": tokens_seen / training_time_seconds,
         "peak_memory_mib": peak_memory_mib,
     }
     print0(f"peak memory consumption: {peak_memory_mib} MiB")
     final_val_text = "n/a" if final_val_loss is None else f"{final_val_loss:.6f}"
     print0(
-        f"final val loss: {final_val_text} | tokens: {total_tokens:,} | "
+        f"final val loss: {final_val_text} | tokens: {tokens_seen:,} | "
+        f"optimizer updates: {completed_steps:,} | "
         f"train time: {training_time_seconds/3600:.3f}h | "
         f"throughput: {summary['tokens_per_second']:,.0f} tok/s"
     )
 
     if master_process:
         if not args.skip_final_checkpoint:
-            save_checkpoint(args.num_iterations)
+            save_checkpoint(completed_steps)
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
