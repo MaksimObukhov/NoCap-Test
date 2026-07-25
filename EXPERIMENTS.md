@@ -20,6 +20,50 @@ Rules:
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
 | exp001 | 24.7 | `e3c9ed0` | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | proxy s0 | 3.56079 | — | **−0.03698** | +0.83% algo overhead | criterion met, but effect decays — do not promote to full yet | ~$0.75 |
 | exp002 | 25.7 | `9185772` | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | measurement, 1788 updates | 3.59701 (baseline reproduction) | — | −0.00077 vs baseline s0 | 4.01s | prediction 1 confirmed, prediction 2 falsified — the baseline is over-batched ~4.9× for 97% of the run | ~$0.75 |
+| exp003 | 25.7 | pending | flat effective batch 16,384 tokens for the whole run (accum=1), LR ∝ √B = 3.182e-4 | proxy s0 = **3.4256** (−0.1722), predicted before the run from the exp002 B_crit curve; see predictions below | planned | — | — | — | — | — | ~$0.75 |
+
+## exp003 — flat small batch (25.7.2026)
+
+**One sentence.** exp002 measured that the baseline's 524,288-token batch is ~4.9× larger than the gradient noise scale for 97% of the run; exp003 stops paying for that by updating every 16,384 tokens instead, over the identical token budget and identical data order.
+
+**Why flat and not a ramp.** Token cost per unit of optimization progress goes as `B + B_crit`. That is monotonically decreasing in `B` — there is no interior optimum, so the best schedule is "as small as overhead allows", and any ramp loses because it spends most of its time at a large batch. This is what retired the exp001 shape; exp003 is the shape the measurement actually points at.
+
+**What changes and what does not.** The micro-batch stays 16×1024, so the data order is bit-identical to the baseline and to exp001 — only the grouping of micro-batches into updates differs. The token budget stays pinned at 937,426,944 via the token-indexed loop from exp001 (`e3c9ed0`), so warmup/warmdown/validation land at the same token positions. Number of optimizer updates goes 1,788 → 57,216.
+
+### Sizing, computed before the run
+
+`ceiling_from_noise_scale.py` at `1f90719` on `exp002/noise-scale`, run against `nocap-runs-backup/exp002-noise-scale/exp002-noise-scale-seed-0/metrics.jsonl`:
+
+| schedule | calibrated token saving | implied val loss |
+|---|---|---|
+| **accum=1 flat (16,384)** | **53.6%** | **−0.1722** |
+| accum=2 flat (32,768) | 50.2% | −0.1562 |
+| accum=4 flat (65,536) | 44.0% | −0.1299 |
+| accum=8 flat (131,072) | 33.6% | −0.0918 |
+| track B_crit exactly | 33.3% | −0.0909 |
+| 16k → 524k ramped over 97% | 17.0% | −0.0419 |
+| exp001 as run | 6% (measured) | −0.037 (measured) |
+
+Token saving converts to loss through the schedule family's own slope, 0.1555 nats per doubling of the token budget (proxy 0.94B → 3.59777, full 2.5B → 3.37770): saving a fraction `X` buys `log2(1/(1−X))` extra doublings.
+
+**Why accum=1 and not the safer accum=4.** Two reasons, and neither is "the number is bigger".
+
+1. *The LR rule is least ambiguous at accum=1.* We scale LR ∝ √B, but McCandlish's own theory says the optimum is `ε_max/(1 + B_crit/B)`, which is linear in B when `B ≪ B_crit` and flat when `B ≫ B_crit`. Evaluating that against the measured B_crit curve and weighting by tokens gives an optimal LR ratio of 0.2031 at accum=1 versus the √B rule's 0.1768 — 13% apart. At accum=4 the same comparison is 0.4863 vs 0.3536, **38% apart**. Running accum=4 with the √B rule would under-drive the LR by a quarter, and a miss would be unattributable: model too optimistic, or LR too low? At accum=1 that fork mostly closes. (The near-agreement at accum=1 is a property of this curve, not a law — the two rules cross somewhere, and here the crossing lands near accum=1–2.)
+2. *accum=4 does not remove the Adam risk, it divides it by four.* 14,304 updates is still an 8× compression of every moment window relative to the baseline. A half-sized result at accum=4 would not distinguish "the cost model overstates" from "Adam is the binding constraint". accum=1 tests the ceiling and the main risk in the same $0.75.
+
+**Learning rate.** `0.0018 × √(16,384/524,288) = 3.182e-4`, applied through the existing `lr_batch_scale`, i.e. the same coupling rule exp001 used. Kept deliberately at the √B rule rather than the noise-scale-optimal 3.656e-4, so that exp003 and exp001 remain comparable and the batch is the only knob that moved.
+
+### Predictions, written before the run
+
+1. **Point prediction: proxy s0 = 3.4256, i.e. −0.1722 vs the baseline's 3.59777.** This is the least trustworthy line here and it is stated anyway so the miss is measurable: the 2.9× calibration factor was fitted on a 6% effect at a 1.6× batch change and is being applied to a 53.6% effect at a 32× batch change. The interval I would actually bet on is **−0.08 to −0.17**.
+2. **Retention, not just size.** exp001's advantage decayed because after the ramp ended both runs were physically identical (Δ 0.084 at 50% → 0.037 at 100%, 44% retained). exp003 keeps the small batch to the last token, so that mechanism is absent. Prediction: **Δ(100%) / Δ(50%) > 0.70**. If retention is instead ~0.44 again, the decay is not about "when the intervention stops" and the exp001 explanation was wrong.
+3. **Stability without divergence.** No `clip_grad_norm_` exists anywhere in `train_gpt2.py`, so small-batch gradient noise is not distorted by clipping. Update-to-update train-loss std should rise roughly as 1/√B, i.e. ×√32 ≈ 5.7 over the baseline's 0.0633, to **~0.36**. No NaN, no divergence.
+4. **Wall-clock overhead +4.1%.** The fixed cost of one optimizer update, fitted from exp001's two in-run points (126.33 ms/micro-batch at accum=8 vs 125.83 at accum=32), is C ≈ 5.3 ms; at accum=1 that is paid every micro-batch. This is the number that decides whether a token saving becomes a wall-clock win, and the fit is a two-point extrapolation from 8 down to 1, so it is the prediction most likely to be off. Do not compare against any step time recorded on another instance.
+5. **The falsifier that matters.** The cost model gives accum=1 a 2.15× token advantage against exp001's 1.06×. If proxy s0 lands **worse than exp001's 3.56079**, the batch direction has hit the Adam-timescale ceiling rather than a modelling error, and exp004 should be β2 (0.95 → 0.99) at fixed accum=1 — a clean single-knob test — not a different batch size.
+
+**Known caveats, unchanged from exp002.** B_crit was measured on raw gradients while AdamW is adaptive, so the curve may be systematically biased for this optimizer. β1=0.9 / β2=0.95 are timescales in steps: at accum=1 the β2 window covers 327,680 tokens instead of 10,485,760, and β2=0.95 is a large-batch convention in the first place. The token-indexed loop does put warmup on tokens (50.3M ⇒ 3,072 updates of warmup at accum=1), so the moment estimates are at least not being asked to converge in 96 steps.
+
+**Cost.** Straight to proxy seed 0, smoke skipped by decision: 2.1 h + ~4% overhead, single 4090, ≈ $0.75. Skipping smoke trades a $0.25 insurance premium against a $0.75 exposure; accepted because there is no clipping, the LR coupling is the one already validated in exp001, and neither model nor data changed.
 
 ## exp002 — gradient noise scale measurement (25.7.2026)
 
