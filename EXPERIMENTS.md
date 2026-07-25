@@ -19,6 +19,38 @@ Rules:
 |----|------|--------|-------------------|------------------------------|---------------|----------|------------|-------------------|-----------|---------|------|
 | exp000 | 18.7 | bd681a3 | baseline, no changes | — | full | 3.59777 | 3.59935 | — | 4.14s | reference | ~$4 |
 | exp001 | 24.7 | `e3c9ed0` | effective batch 131,072→524,288 over first 50% of tokens; LR ∝ √B | same token budget/data order; proxy s0 improves by ≥0.004 with ≤1% wall-time overhead | proxy s0 | 3.56079 | — | **−0.03698** | +0.83% algo overhead | criterion met, but effect decays — do not promote to full yet | ~$0.75 |
+| exp002 | 25.7 | pending | measure the gradient noise scale B_simple along the baseline trajectory (no training change) | B_simple ≪ 524,288 early and crosses it well before 50% of tokens; see predictions below | planned | n/a (measurement) | — | — | — | pending | ~$0.25 |
+
+## exp002 — gradient noise scale measurement (25.7.2026)
+
+**This is a measurement, not an intervention.** Training is unchanged; the run only instruments the baseline trajectory. It exists because exp001's ramp schedule was guessed (8→32 over 50% of tokens) and its biggest open risk — proportional vs absolute indexing of the ramp — is a question about B_crit, which is measurable rather than arguable.
+
+**Method.** McCandlish et al. 2018, *An Empirical Model of Large-Batch Training*, Appendix A. During gradient accumulation we already compute one gradient per micro-batch, so both quantities the estimator needs are almost free:
+
+- `|G_small|²` = mean over micro-batches of `|g_i|²`, at B_small = 16,384 tokens
+- `|G_big|²`   = `|mean_i g_i|²`, at B_big = accumulation × 16,384 tokens
+
+then, with `B` in tokens:
+
+```
+|G|²      = (B_big·|G_big|² − B_small·|G_small|²) / (B_big − B_small)     unbiased |true gradient|²
+tr(Σ)     = (|G_small|² − |G_big|²) / (1/B_small − 1/B_big)               unbiased gradient variance
+B_simple  = tr(Σ) / |G|²
+```
+
+`B_simple` is the batch size at which gradient noise equals gradient signal. Below it, doubling the batch nearly doubles progress per step; above it, doubling the batch buys almost nothing while costing 2× compute. It is expected to *grow* during training as the easy, mutually-consistent gradient directions get used up.
+
+**Predictions, written before the run** (the point is to be wrong in an informative way, not to pass a threshold):
+
+1. `B_simple` in the first ~10M tokens is of order 10⁴–10⁵ tokens, i.e. **at least 5× below the baseline's 524,288** — this is what exp001's −0.75 nats at 7% of the budget implies, and it would confirm the early phase is over-batched rather than the improvement being an LR artefact.
+2. `B_simple` crosses 524,288 **before 50% of the proxy budget (0.47B tokens)**. If it crosses much earlier — say around 0.15B — then exp001's ramp held the batch small roughly 2–3× too long, and the fraction-of-budget indexing is the wrong parameterisation.
+3. `B_simple` grows monotonically apart from estimator noise (it is a ratio of two noisy quantities from ~32 samples, so single-step estimates will be jumpy; judge the smoothed trend, not individual points).
+
+If (1) is false — `B_simple` already near or above 524,288 at the start — then the batch story is dead, exp001's gain was an LR-schedule effect, and the next run should be the LR-only control instead.
+
+**Success criterion.** Not a loss number. The run succeeds if it produces a `B_simple(tokens)` curve whose smoothed trend is stable enough to read a crossing point off it. That crossing point then parameterises any future batch ramp, and the same instrumentation is reusable for the sequence-length curriculum.
+
+**Cost.** ~400 updates ≈ 30 min plus a 50-update A/A gate ≈ 5 min, single 4090 ≈ $0.25.
 
 ## exp001 — batch ramp, proxy seed 0 (24.7.2026)
 
