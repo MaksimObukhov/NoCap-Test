@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -95,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=Path("data/fineweb10B/fineweb_edu_scores.jsonl"),
-        help="JSONL output. Existing files are not overwritten.",
+        help="JSONL output. Existing files require --resume.",
     )
     parser.add_argument("--num-iterations", type=int, default=4768)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -118,6 +119,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Maximum classifier-tokenizer length per document.",
+    )
+    parser.add_argument(
+        "--classifier-batch-size",
+        type=int,
+        default=None,
+        help="Inference batch size (default: 1 on CPU, 64 on CUDA).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda", "mps", "auto"),
+        default="cpu",
+        help="Inference device. Use explicit 'cuda' for the remote run.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default="float32",
+        help="Model dtype. float32 is the reproducible default.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append after the last complete JSONL record.",
     )
     parser.add_argument(
         "--plan-only",
@@ -358,7 +382,7 @@ def append_segment(
     return document
 
 
-def load_cpu_classifier():
+def load_classifier(device_name: str, dtype_name: str):
     try:
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -368,30 +392,214 @@ def load_cpu_classifier():
             "  uv pip install --python .venv-dev/bin/python transformers tiktoken"
         ) from exc
 
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            device_name = "cuda"
+        elif torch.backends.mps.is_available():
+            device_name = "mps"
+        else:
+            device_name = "cpu"
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but CUDA is unavailable")
+    if device_name == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("--device mps requested but MPS is unavailable")
+    if device_name == "cpu" and dtype_name == "float16":
+        raise ValueError("float16 inference on CPU is unsupported; use float32")
+
+    dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[dtype_name]
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_ID)
     model.eval()
-    model.to("cpu")
-    return torch, tokenizer, model
+    model.to(device=device_name, dtype=dtype)
+    return torch, tokenizer, model, device_name
 
 
-def score_text(
-    text: str,
+def score_texts(
+    texts: Sequence[str],
     *,
     torch_module,
     tokenizer,
     model,
+    device_name: str,
     max_length: int,
-) -> float:
+) -> list[float]:
     inputs = tokenizer(
-        text,
+        list(texts),
         return_tensors="pt",
+        padding=True,
         truncation=True,
         max_length=max_length,
     )
+    inputs = {name: tensor.to(device_name) for name, tensor in inputs.items()}
     with torch_module.inference_mode():
         outputs = model(**inputs)
-    return float(outputs.logits.squeeze().float().item())
+    return outputs.logits.reshape(-1).float().cpu().tolist()
+
+
+@dataclass
+class ClassificationStats:
+    documents: int = 0
+    selected_tokens: int = 0
+    high_quality_selected_tokens: int = 0
+    score_sum: float = 0.0
+    score_min: float = math.inf
+    score_max: float = -math.inf
+
+    def add(self, record: dict) -> None:
+        self.documents += 1
+        self.selected_tokens += int(record["selected_token_count"])
+        if record["is_high_quality"]:
+            self.high_quality_selected_tokens += int(record["selected_token_count"])
+        score = float(record["score"])
+        self.score_sum += score
+        self.score_min = min(self.score_min, score)
+        self.score_max = max(self.score_max, score)
+
+
+def make_record(
+    document: Document,
+    score: float,
+    document_index: int,
+    shards: Sequence[ShardInfo],
+    threshold: int,
+    text: str,
+) -> dict:
+    int_score = int(round(max(0.0, min(score, 5.0))))
+    return {
+        "document_index": document_index,
+        "start_shard": shards[document.start_shard].path.name,
+        "start_offset": document.start_offset,
+        "end_shard": shards[document.end_shard].path.name,
+        "end_offset": document.end_offset,
+        "document_token_count": document.token_count,
+        "selected_token_count": document.selected_token_count,
+        "starts_with_eot": document.starts_with_eot,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "score": score,
+        "int_score": int_score,
+        "is_high_quality": int_score >= threshold,
+    }
+
+
+def manifest_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".manifest.json")
+
+
+def summary_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".summary.json")
+
+
+def atomic_write_json(path: Path, value: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def run_manifest(plan: dict, threshold: int, classifier_max_length: int) -> dict:
+    selection_json = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    return {
+        "schema_version": 2,
+        "model": MODEL_ID,
+        "int_score_threshold": threshold,
+        "classifier_max_length": classifier_max_length,
+        "selection_sha256": hashlib.sha256(selection_json.encode()).hexdigest(),
+        "selection": plan,
+    }
+
+
+def read_existing_output(output: Path) -> tuple[ClassificationStats, dict | None]:
+    stats = ClassificationStats()
+    last_record = None
+    with output.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{output}:{line_number}: incomplete JSONL record; "
+                    "truncate that final line before resuming"
+                ) from exc
+            if record.get("document_index") != stats.documents:
+                raise ValueError(
+                    f"{output}:{line_number}: expected document_index "
+                    f"{stats.documents}, found {record.get('document_index')}"
+                )
+            stats.add(record)
+            last_record = record
+    return stats, last_record
+
+
+def prepare_output(
+    output: Path, *, resume: bool, expected_manifest: dict
+) -> tuple[ClassificationStats, dict | None]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = manifest_path(output)
+    if output.exists():
+        if not resume:
+            raise FileExistsError(
+                f"{output} already exists; pass --resume or choose another output"
+            )
+        if not metadata_path.exists():
+            raise ValueError(f"{metadata_path} is missing; refusing unsafe resume")
+        actual_manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if actual_manifest != expected_manifest:
+            raise ValueError("resume configuration does not match the output manifest")
+        return read_existing_output(output)
+
+    output.touch(exist_ok=False)
+    atomic_write_json(metadata_path, expected_manifest)
+    return ClassificationStats(), None
+
+
+def build_summary(
+    *,
+    stats: ClassificationStats,
+    plan: dict,
+    threshold: int,
+    classifier_max_length: int,
+    classifier_batch_size: int,
+    device_name: str,
+    dtype_name: str,
+    session_started: float,
+    resumed_from_documents: int,
+) -> dict:
+    elapsed = time.monotonic() - session_started
+    session_documents = stats.documents - resumed_from_documents
+    return {
+        "schema_version": 2,
+        "model": MODEL_ID,
+        "device": device_name,
+        "dtype": dtype_name,
+        "classifier_batch_size": classifier_batch_size,
+        "int_score_threshold": threshold,
+        "classifier_max_length": classifier_max_length,
+        "complete": stats.selected_tokens == plan["selected_tokens"],
+        "documents_scored": stats.documents,
+        "selected_tokens_scored": stats.selected_tokens,
+        "high_quality_selected_tokens": stats.high_quality_selected_tokens,
+        "high_quality_token_fraction": (
+            stats.high_quality_selected_tokens / stats.selected_tokens
+            if stats.selected_tokens
+            else None
+        ),
+        "score_mean": stats.score_sum / stats.documents if stats.documents else None,
+        "score_min": stats.score_min if stats.documents else None,
+        "score_max": stats.score_max if stats.documents else None,
+        "session_elapsed_seconds": elapsed,
+        "session_documents": session_documents,
+        "session_documents_per_second": (
+            session_documents / elapsed if elapsed else None
+        ),
+        "resumed_from_documents": resumed_from_documents,
+        "selection": plan,
+    }
 
 
 def classify(
@@ -401,17 +609,19 @@ def classify(
     output: Path,
     threshold: int,
     classifier_max_length: int,
+    classifier_batch_size: int | None,
+    device_name: str,
+    dtype_name: str,
+    resume: bool,
     max_documents: int | None,
     plan: dict,
 ) -> dict:
-    if output.exists():
-        raise FileExistsError(
-            f"{output} already exists; move or remove it before starting a new run"
-        )
     if not 0 <= threshold <= 5:
         raise ValueError("--threshold must be between 0 and 5")
     if max_documents is not None and max_documents <= 0:
         raise ValueError("--max-documents must be positive")
+    if classifier_batch_size is not None and classifier_batch_size <= 0:
+        raise ValueError("--classifier-batch-size must be positive")
 
     try:
         import tiktoken
@@ -421,97 +631,118 @@ def classify(
             "  uv pip install --python .venv-dev/bin/python tiktoken"
         ) from exc
 
-    torch_module, tokenizer, model = load_cpu_classifier()
-    decoder = tiktoken.get_encoding("gpt2")
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    started = time.monotonic()
-    documents = 0
-    selected_tokens_scored = 0
-    high_quality_selected_tokens = 0
-    score_sum = 0.0
-    score_min = math.inf
-    score_max = -math.inf
-
-    with output.open("x", encoding="utf-8") as file:
-        for document in iter_selected_documents(shards, spans):
-            text_token_ids = document.text_tokens()
-            text = decoder.decode(text_token_ids.tolist())
-            score = score_text(
-                text,
-                torch_module=torch_module,
-                tokenizer=tokenizer,
-                model=model,
-                max_length=classifier_max_length,
-            )
-            int_score = int(round(max(0.0, min(score, 5.0))))
-            is_high_quality = int_score >= threshold
-            record = {
-                "document_index": documents,
-                "start_shard": shards[document.start_shard].path.name,
-                "start_offset": document.start_offset,
-                "end_shard": shards[document.end_shard].path.name,
-                "end_offset": document.end_offset,
-                "document_token_count": document.token_count,
-                "selected_token_count": document.selected_token_count,
-                "starts_with_eot": document.starts_with_eot,
-                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                "score": score,
-                "int_score": int_score,
-                "is_high_quality": is_high_quality,
-            }
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            file.flush()
-
-            documents += 1
-            selected_tokens_scored += document.selected_token_count
-            if is_high_quality:
-                high_quality_selected_tokens += document.selected_token_count
-            score_sum += score
-            score_min = min(score_min, score)
-            score_max = max(score_max, score)
-
-            elapsed = time.monotonic() - started
-            print(
-                f"\rdocuments={documents:,} "
-                f"selected_tokens={selected_tokens_scored:,} "
-                f"docs/s={documents / max(elapsed, 1e-9):.2f}",
-                end="",
-                flush=True,
-            )
-            if max_documents is not None and documents >= max_documents:
-                break
-    print()
-
-    elapsed = time.monotonic() - started
-    completed = selected_tokens_scored == plan["selected_tokens"]
-    summary = {
-        "schema_version": 1,
-        "model": MODEL_ID,
-        "device": "cpu",
-        "int_score_threshold": threshold,
-        "classifier_max_length": classifier_max_length,
-        "complete": completed,
-        "documents_scored": documents,
-        "selected_tokens_scored": selected_tokens_scored,
-        "high_quality_selected_tokens": high_quality_selected_tokens,
-        "high_quality_token_fraction": (
-            high_quality_selected_tokens / selected_tokens_scored
-            if selected_tokens_scored
-            else None
-        ),
-        "score_mean": score_sum / documents if documents else None,
-        "score_min": score_min if documents else None,
-        "score_max": score_max if documents else None,
-        "elapsed_seconds": elapsed,
-        "documents_per_second": documents / elapsed if elapsed else None,
-        "selection": plan,
-    }
-    summary_path = output.with_suffix(output.suffix + ".summary.json")
-    summary_path.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    torch_module, tokenizer, model, device_name = load_classifier(
+        device_name, dtype_name
     )
+    if classifier_batch_size is None:
+        classifier_batch_size = 64 if device_name == "cuda" else 1
+    decoder = tiktoken.get_encoding("gpt2")
+    expected_manifest = run_manifest(plan, threshold, classifier_max_length)
+    stats, last_record = prepare_output(
+        output, resume=resume, expected_manifest=expected_manifest
+    )
+    resumed_from_documents = stats.documents
+    session_started = time.monotonic()
+    pending_documents: list[Document] = []
+    pending_texts: list[str] = []
+
+    def flush_batch(file) -> None:
+        nonlocal pending_documents, pending_texts
+        if not pending_documents:
+            return
+        scores = score_texts(
+            pending_texts,
+            torch_module=torch_module,
+            tokenizer=tokenizer,
+            model=model,
+            device_name=device_name,
+            max_length=classifier_max_length,
+        )
+        for document, text, score in zip(
+            pending_documents, pending_texts, scores, strict=True
+        ):
+            record = make_record(
+                document,
+                score,
+                stats.documents,
+                shards,
+                threshold,
+                text,
+            )
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stats.add(record)
+        file.flush()
+        pending_documents = []
+        pending_texts = []
+
+        elapsed = time.monotonic() - session_started
+        session_documents = stats.documents - resumed_from_documents
+        print(
+            f"\rdocuments={stats.documents:,} "
+            f"selected_tokens={stats.selected_tokens:,} "
+            f"session_docs/s={session_documents / max(elapsed, 1e-9):.2f}",
+            end="",
+            flush=True,
+        )
+
+    try:
+        with output.open("a", encoding="utf-8") as file:
+            for document_index, document in enumerate(
+                iter_selected_documents(shards, spans)
+            ):
+                if document_index < resumed_from_documents:
+                    if (
+                        document_index == resumed_from_documents - 1
+                        and last_record is not None
+                    ):
+                        expected_end = (
+                            shards[document.end_shard].path.name,
+                            document.end_offset,
+                        )
+                        actual_end = (
+                            last_record["end_shard"],
+                            last_record["end_offset"],
+                        )
+                        if actual_end != expected_end:
+                            raise ValueError(
+                                "resume output does not match the selected token stream"
+                            )
+                        text_hash = hashlib.sha256(
+                            decoder.decode(document.text_tokens().tolist()).encode(
+                                "utf-8"
+                            )
+                        ).hexdigest()
+                        if last_record["text_sha256"] != text_hash:
+                            raise ValueError(
+                                "resume output text hash does not match the input shards"
+                            )
+                    continue
+                if (
+                    max_documents is not None
+                    and stats.documents + len(pending_documents) >= max_documents
+                ):
+                    break
+
+                text = decoder.decode(document.text_tokens().tolist())
+                pending_documents.append(document)
+                pending_texts.append(text)
+                if len(pending_documents) >= classifier_batch_size:
+                    flush_batch(file)
+            flush_batch(file)
+    finally:
+        print()
+        summary = build_summary(
+            stats=stats,
+            plan=plan,
+            threshold=threshold,
+            classifier_max_length=classifier_max_length,
+            classifier_batch_size=classifier_batch_size,
+            device_name=device_name,
+            dtype_name=dtype_name,
+            session_started=session_started,
+            resumed_from_documents=resumed_from_documents,
+        )
+        atomic_write_json(summary_path(output), summary)
     return summary
 
 
@@ -542,6 +773,10 @@ def main() -> int:
         output=args.output,
         threshold=args.threshold,
         classifier_max_length=args.classifier_max_length,
+        classifier_batch_size=args.classifier_batch_size,
+        device_name=args.device,
+        dtype_name=args.dtype,
+        resume=args.resume,
         max_documents=args.max_documents,
         plan=plan,
     )
@@ -552,6 +787,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
