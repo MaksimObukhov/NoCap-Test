@@ -383,6 +383,14 @@ def build_train_shape_stages(
     ]
 
 
+def compile_dynamic_from_policy(policy):
+    if policy == "auto":
+        return None
+    if policy == "static":
+        return False
+    raise ValueError(f"unknown compile shape policy: {policy}")
+
+
 def train_shape_stage_for_step(stages, step, num_iterations):
     active_step = min(step, num_iterations - 1)
     for stage in stages:
@@ -546,6 +554,15 @@ if __name__ == "__main__":
         default=1,
         help="optimizer steps to save in the profiler trace",
     )
+    parser.add_argument(
+        "--compile_shape_policy",
+        choices=["auto", "static"],
+        default="auto",
+        help=(
+            "auto lets torch.compile generalize changing shapes; static compiles "
+            "a separate graph for each observed shape"
+        ),
+    )
     parser.add_argument("--log_wandb", action="store_true", help="log to W&B")
     parser.add_argument("--wandb_project", type=str, default="nocap-baseline")
     parser.add_argument("--wandb_group", type=str, default="")
@@ -612,6 +629,7 @@ if __name__ == "__main__":
             "train_batch_size_after",
             "train_sequence_length_after",
             "validation_sequence_length",
+            "compile_shape_policy",
             "num_iterations",
             "learning_rate",
             "warmup_iters",
@@ -746,7 +764,10 @@ if __name__ == "__main__":
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True
     print0("compiling the model...")
-    model = torch.compile(base_model)
+    model = torch.compile(
+        base_model,
+        dynamic=compile_dynamic_from_policy(args.compile_shape_policy),
+    )
     model = DDP(model, device_ids=[ddp_local_rank])
 
     optimizer = base_model.configure_optimizers(
