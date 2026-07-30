@@ -5,6 +5,7 @@ import math
 import glob
 import json
 import random
+import hashlib
 import subprocess
 from dataclasses import dataclass
 
@@ -304,6 +305,93 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def sha256_file(path, chunk_bytes=8 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(chunk_bytes):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_sha256(value):
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_curriculum_manifest(
+    path,
+    *,
+    input_pattern,
+    tokens_per_update,
+    num_iterations,
+    allow_prefix,
+):
+    with open(path, encoding="utf-8") as file:
+        manifest = json.load(file)
+
+    payload_sha256 = manifest.get("manifest_payload_sha256")
+    payload_without_hash = dict(manifest)
+    payload_without_hash.pop("manifest_payload_sha256", None)
+    if payload_sha256 != canonical_sha256(payload_without_hash):
+        raise ValueError(f"{path}: manifest payload SHA-256 mismatch")
+
+    accounting = manifest["accounting"]
+    if int(accounting["tokens_per_update"]) != tokens_per_update:
+        raise ValueError(
+            f"{path}: manifest has {accounting['tokens_per_update']:,} "
+            f"tokens/update, run has {tokens_per_update:,}"
+        )
+    required_tokens = num_iterations * tokens_per_update
+    available_tokens = int(accounting["output_target_tokens"])
+    if allow_prefix:
+        if required_tokens > available_tokens:
+            raise ValueError(
+                f"{path}: run needs {required_tokens:,} targets, "
+                f"manifest contains only {available_tokens:,}"
+            )
+    elif required_tokens != available_tokens:
+        raise ValueError(
+            f"{path}: run needs {required_tokens:,} targets, "
+            f"manifest contains {available_tokens:,}"
+        )
+
+    stages = manifest["curriculum"]["stages"]
+    if not stages:
+        raise ValueError(f"{path}: curriculum has no stages")
+    expected_start = 0
+    stage_token_total = 0
+    for stage_index, stage in enumerate(stages):
+        start = int(stage["start_update"])
+        end = int(stage["end_update_exclusive"])
+        if int(stage["index"]) != stage_index:
+            raise ValueError(f"{path}: non-contiguous curriculum stage indices")
+        if start != expected_start or end <= start:
+            raise ValueError(f"{path}: gap, overlap, or empty curriculum stage")
+        expected_stage_tokens = (end - start) * tokens_per_update
+        if int(stage["target_tokens"]) != expected_stage_tokens:
+            raise ValueError(f"{path}: stage {stage_index} token count is inconsistent")
+        stage_token_total += expected_stage_tokens
+        expected_start = end
+    if stage_token_total != available_tokens:
+        raise ValueError(f"{path}: curriculum stages do not cover the output budget")
+    if expected_start < num_iterations:
+        raise ValueError(f"{path}: curriculum stages do not cover this run")
+
+    manifest_dir = os.path.dirname(os.path.abspath(path))
+    expected_files = [
+        os.path.realpath(os.path.join(manifest_dir, shard["file"]))
+        for shard in manifest["output"]["shards"]
+    ]
+    actual_files = [os.path.realpath(filename) for filename in sorted(glob.glob(input_pattern))]
+    if actual_files != expected_files:
+        raise ValueError(
+            f"{path}: --input_bin resolves to files other than the manifested shards"
+        )
+    return manifest, sha256_file(path)
+
+
 if __name__ == "__main__":
     import argparse
     import time
@@ -340,6 +428,12 @@ if __name__ == "__main__":
         type=str,
         default="data/fineweb10B/fineweb_train_*.bin",
         help="input .bin to train on",
+    )
+    parser.add_argument(
+        "--input_manifest",
+        type=str,
+        default="",
+        help="auditable curriculum manifest for --input_bin",
     )
     parser.add_argument(
         "--input_val_bin",
@@ -480,10 +574,24 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
 
+    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
+    curriculum_manifest = None
+    input_manifest_sha256 = None
+    if args.input_manifest:
+        curriculum_manifest, input_manifest_sha256 = load_curriculum_manifest(
+            args.input_manifest,
+            input_pattern=args.input_bin,
+            tokens_per_update=tokens_per_iter,
+            num_iterations=args.num_iterations,
+            allow_prefix=args.run_mode == "smoke",
+        )
+
     resume_checkpoint = None
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         resume_keys = (
+            "input_bin",
+            "input_manifest",
             "seed",
             "run_mode",
             "model",
@@ -521,13 +629,17 @@ if __name__ == "__main__":
         "cuda_version": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version(),
         "world_size": ddp_world_size,
+        "input_manifest_sha256": input_manifest_sha256,
     }
 
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
     checkpoint_path = os.path.join(args.output_dir, "checkpoint.pt")
     summary_path = os.path.join(args.output_dir, "summary.json")
+    input_manifest_copy_path = os.path.join(args.output_dir, "input_manifest.json")
     if master_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        if curriculum_manifest is not None:
+            write_json_atomic(input_manifest_copy_path, curriculum_manifest)
         write_json_atomic(
             os.path.join(args.output_dir, "config.json"),
             {"args": vars(args), "metadata": metadata},
@@ -563,11 +675,14 @@ if __name__ == "__main__":
         )
         wandb.save("train_gpt2.py", policy="now")
         wandb.save("run.sh", policy="now")
+        if curriculum_manifest is not None:
+            wandb.save("data/build_exp004_curriculum.py", policy="now")
+            wandb.save("run_exp004.sh", policy="now")
+            wandb.save(input_manifest_copy_path, policy="now")
 
     print0(f"using device: {device} ({metadata['gpu_name']})")
     print0(f"run: {args.run_name} | seed: {args.seed} | output: {args.output_dir}")
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
     print0(f"tokens per iteration: {tokens_per_iter:,}")
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
@@ -638,6 +753,26 @@ if __name__ == "__main__":
 
     def elapsed_wall_seconds():
         return previous_wall_time_seconds + time.perf_counter() - session_wall_start
+
+    curriculum_stages = (
+        curriculum_manifest["curriculum"]["stages"]
+        if curriculum_manifest is not None
+        else []
+    )
+    current_data_stage_index = None
+
+    def data_stage_for_step(step):
+        if not curriculum_stages:
+            return None
+        active_step = min(step, args.num_iterations - 1)
+        for stage in curriculum_stages:
+            if (
+                int(stage["start_update"])
+                <= active_step
+                < int(stage["end_update_exclusive"])
+            ):
+                return stage
+        raise ValueError(f"curriculum manifest does not cover update {active_step}")
 
     def save_checkpoint(next_step):
         if not master_process:
@@ -717,6 +852,28 @@ if __name__ == "__main__":
 
     for step in range(start_step, args.num_iterations + 1):
         last_step = step == args.num_iterations
+        data_stage = data_stage_for_step(step)
+        if (
+            data_stage is not None
+            and int(data_stage["index"]) != current_data_stage_index
+        ):
+            current_data_stage_index = int(data_stage["index"])
+            stage_record = {
+                "event": "data_stage",
+                "step": step,
+                "tokens_seen": step * tokens_per_iter,
+                "data_stage_index": current_data_stage_index,
+                "data_stage_name": data_stage["name"],
+                "training_time_seconds": training_time_ms / 1000,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+            print0(
+                f"data stage {current_data_stage_index}: "
+                f"{data_stage['name']} at update {step}"
+            )
+            log_local(stage_record)
+            if wandb_run is not None:
+                wandb_run.log(stage_record)
 
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             model.eval()
@@ -738,6 +895,8 @@ if __name__ == "__main__":
                 "training_time_seconds": training_time_ms / 1000,
                 "wall_time_seconds": elapsed_wall_seconds(),
             }
+            if current_data_stage_index is not None:
+                validation_record["data_stage_index"] = current_data_stage_index
             print0(
                 f"step:{step}/{args.num_iterations} | val loss {final_val_loss:.6f}"
             )
@@ -787,6 +946,8 @@ if __name__ == "__main__":
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
         }
+        if current_data_stage_index is not None:
+            train_record["data_stage_index"] = current_data_stage_index
         print0(
             f"step:{completed_steps}/{args.num_iterations} | loss {lossf:.6f} | "
             f"lr:{lr:.6g} | train_time:{training_time_ms/1000:.2f}s | "
@@ -818,6 +979,7 @@ if __name__ == "__main__":
         "git_commit": git_commit,
         "git_dirty": git_dirty,
         "gpu_name": metadata["gpu_name"],
+        "input_manifest_sha256": input_manifest_sha256,
         "final_val_loss": final_val_loss,
         "num_iterations": args.num_iterations,
         "tokens_seen": total_tokens,

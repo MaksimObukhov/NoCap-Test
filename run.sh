@@ -47,6 +47,13 @@ if [[ -z "$OUTPUT_DIR" ]]; then
 fi
 
 RUN_NAME="${MODE}-seed-${SEED}"
+TRAIN_INPUT_BIN="${TRAIN_INPUT_BIN:-data/fineweb10B/fineweb_train_*.bin}"
+TRAIN_INPUT_MANIFEST="${TRAIN_INPUT_MANIFEST:-}"
+INPUT_MANIFEST_ARGS=()
+if [[ -n "$TRAIN_INPUT_MANIFEST" ]]; then
+  INPUT_MANIFEST_ARGS+=(--input_manifest "$TRAIN_INPUT_MANIFEST")
+fi
+
 WANDB_ARGS=()
 if [[ "${WANDB_ENABLED:-1}" == "1" ]]; then
   WANDB_ARGS+=(
@@ -62,7 +69,8 @@ mkdir -p "$OUTPUT_DIR"
 echo "mode=$MODE seed=$SEED output_dir=$OUTPUT_DIR"
 
 torchrun --standalone --nproc_per_node=1 train_gpt2.py \
-  --input_bin "data/fineweb10B/fineweb_train_*.bin" \
+  --input_bin "$TRAIN_INPUT_BIN" \
+  "${INPUT_MANIFEST_ARGS[@]}" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$RUN_NAME" \
