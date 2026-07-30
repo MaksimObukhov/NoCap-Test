@@ -4,6 +4,7 @@ pylog124M/
 logs/
 runs/
 wandb/
+nocap-runs-backup/
 
 # my files
 notes.md
