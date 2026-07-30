@@ -64,7 +64,8 @@ proposal's cost but does not predict a loss improvement.
 | exp003 | closed, partial proxy | Flat 16,384-token effective batch; LR 3.182e-4 | -0.3847 at 21.5% of budget; +17.6% overhead | Helpful direction, closed as out-of-scope hyperparameter work |
 | exp004-A | completed data analysis | Classified exact baseline FineWeb subset with FineWeb-Edu classifier | 8.2418% of selected tokens are in documents with rounded score >=3 | Evidence for a controlled ordering experiment, not evidence that it helps training |
 | exp004-B | planned proxy | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | No run or implementation yet | Build and audit the stream, then smoke and proxy seed 0 |
-| exp005 | planned proxy | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | No run or implementation yet | Measure compile/shape cost on the target 4090 before proxy |
+| exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
+| exp006 | planned proxy | T=512 for updates 0-383, then T=1024; test final loss at the same tokens, order, LR, and validation | No quality run yet; exp005 gate measured systems cost only | Run proxy seed 0; advance only for loss improvement >=0.004 |
 
 ## Completed experiments
 
@@ -354,7 +355,8 @@ approval after code review.
 
 ### exp005 — staged sequence length, 512 to 1024
 
-**Status:** planned on 30 July 2026; not implemented or run.
+**Status:** stopped at the mandatory systems gate on 30 July 2026; no proxy
+quality run.
 
 **Hypothesis.** With identical target-token order, token budget, effective
 batch, update count, LR schedule, and T=1024 validation, using T=512 for the
@@ -393,6 +395,30 @@ consumes the projected saving, T=512 is less than 3% faster in steady state,
 the normalised projected net saving is below 1%, or compilation falls back to
 eager execution.
 
+**Measured systems-gate result.** Commit `4b5d6f9`, PyTorch 2.11.0+cu128,
+RTX 4090; artifact
+`runs/exp005-shape-gate-host2-static/gate-summary.json`. Both the fixed-T=1024
+control and the scheduled run completed 20 updates. The gate measured:
+
+| Metric | Result |
+|---|---:|
+| Fixed T=1024 steady update | 3,967.44 ms |
+| Scheduled T=512 steady update | 3,864.54 ms |
+| Scheduled T=1024 steady update | 3,964.76 ms |
+| T=512 steady speedup | 2.59% |
+| Additional compile/recompile cost | 175.93 s |
+| Gross projected proxy saving | 89.79 s |
+| Net projected proxy saving | -86.14 s |
+| Normalised projected net speedup | -1.21% |
+
+The long-stage control drift was only -0.07%, so the steady timing comparison
+was internally consistent. The gate failed both the pre-registered 3%
+steady-speedup threshold and the 1% net wall-time threshold. This falsifies the
+systems claim that this discrete schedule is a proxy wall-time optimisation.
+It does **not** test whether changing sequence length improves loss per target
+token: the 20-update gate is too short for a quality conclusion, and the
+pre-registered quality condition was non-inferiority rather than improvement.
+
 **Wall-time definition.** Primary time starts immediately before the first
 compiled model call and ends after final validation. It includes lazy initial
 compile, the T=512 -> T=1024 recompile, optimizer steps, validation, data
@@ -415,9 +441,84 @@ context only.
   eager fallback kills the schedule.
 - Passing seed 0 earns proxy seeds 1/2 before any full run.
 
-**Branch and sequencing.** Implementation branch
+**Verdict and branch.** Implementation branch
 `exp005/sequence-length-512-1024`. It is independent of exp004-B and may run on
-a second instance at the same time, but it is implemented only after exp004-B
-has been reviewed, committed, and launched. The two modifications are never
-combined in one training run. Any paid gate, smoke, or proxy requires explicit
-approval after code review.
+a second instance at the same time. Stop exp005 at the failed systems gate;
+do not reinterpret a future quality run as a continuation of this hypothesis.
+The separate loss-per-token question is pre-registered below as exp006.
+
+### exp006 — sequence-length curriculum for loss per token
+
+**Status:** planned on 30 July 2026; no quality proxy run yet.
+
+**Question separated from exp005.** The exp005 systems gate established that
+the discrete shape schedule is not a net wall-time optimisation at proxy scale.
+It did not establish whether early short-context training changes optimisation
+quality. Exp006 therefore treats loss versus target tokens as primary and
+records compile-aware wall-time only as a secondary cost.
+
+**Hypothesis.** With identical target-token order, total token budget, effective
+batch, optimizer-update count, LR schedule, and fixed T=1024 validation,
+training approximately the first quarter of the proxy at T=512 and the
+remainder at T=1024 will improve final seed-0 validation loss by at least 0.004
+relative to the fixed-T=1024 baseline.
+
+**Literature-grounded schedule choice.** Shortformer kept tokens per batch
+constant and trained every model for the same 205 epochs. Its best staged
+result used the short length for 50 epochs, about 24% of training; nearby
+durations were broadly competitive, while very long short-context stages
+degraded. Sequence Length Warmup found gradual growth more robust for aggressive
+large-model recipes and warned that remaining short for too long can create a
+transition mismatch. A continuously changing T would introduce many compiled
+shapes in this single-GPU proxy, so exp006 uses the closest low-complexity test:
+one transition after approximately 25% of updates.
+
+The proxy validates every 128 updates. The nearest clean boundary on the early
+side of the literature prior is update 384 (21.5% of the run). Using it gives a
+T=1024 validation immediately before the transition; update 447 would be
+mathematically exact but would make the transition trajectory harder to
+interpret.
+
+| Stage | Updates | T | Micro-batch B | Accumulation | Tokens/update |
+|---|---:|---:|---:|---:|---:|
+| short | 0-383 | 512 | 32 | 32 | 524,288 |
+| long | 384-1787 | 1024 | 16 | 32 | 524,288 |
+
+This is 384 short updates and 1,404 long updates. In both stages
+`B * T = 16,384`; therefore each micro-batch and optimizer update consumes the
+same count of flat source targets as baseline. Targets remain in baseline
+order, but their conditioning context is intentionally different: T=512
+introduces more context resets. That difference is the treatment, not evidence
+that the examples are intrinsically easier.
+
+**Metrics and interpretation.**
+
+- Primary: T=1024 validation loss versus target tokens, including final proxy
+  loss after exactly 937,426,944 targets and 1,788 updates.
+- Secondary: earliest token count and end-to-end wall-time at which the run
+  reaches baseline final loss 3.597773. Wall-time includes lazy compile and
+  shape recompilation.
+- Diagnostic: validation trajectory before and after update 384, transition
+  loss spike, per-stage training loss, gradient norm if already available,
+  peak VRAM, compile/recompile report, and W&B continuity.
+- The exp005 20-update loss difference is not prior quality evidence and is not
+  used in the exp006 decision.
+
+**Success and stopping criteria.**
+
+- `final val <= 3.593773` (at least 0.004 better than baseline seed 0) advances
+  to proxy seeds 1 and 2.
+- `final val >= 3.601773` kills the quality hypothesis.
+- The interval `(3.593773, 3.601773)` is inconclusive and does not
+  automatically earn more seeds.
+- OOM, NaN, unrecovered loss spike at the transition, incorrect token/order/LR
+  accounting, eager fallback, or missing durable metrics invalidates the run.
+- A quality win does not retroactively make exp005 a systems win. Report both
+  loss-versus-tokens and compile-inclusive time-to-target.
+
+**Branch and run identity.** Implementation branch
+`exp006/sequence-length-quality`; W&B group and run directories use `exp006`.
+Reuse the reviewed two-shape mechanism, but set the transition explicitly to
+update 384. Exp006 remains independent of exp004-B and uses the unchanged
+baseline FineWeb stream. Paid proxy seed 0 requires a clean pushed SHA,
+recoverable local artifacts plus W&B, and explicit launch approval.
