@@ -63,7 +63,7 @@ proposal's cost but does not predict a loss improvement.
 | exp002 | completed measurement | Measured gradient noise scale along unchanged baseline | Mid-run B_crit about 106k vs 524,288 baseline batch; crossing about 910M tokens | Ramp premise retired; measurement informed exp003 |
 | exp003 | closed, partial proxy | Flat 16,384-token effective batch; LR 3.182e-4 | -0.3847 at 21.5% of budget; +17.6% overhead | Helpful direction, closed as out-of-scope hyperparameter work |
 | exp004-A | completed data analysis | Classified exact baseline FineWeb subset with FineWeb-Edu classifier | 8.2418% of selected tokens are in documents with rounded score >=3 | Evidence for a controlled ordering experiment, not evidence that it helps training |
-| exp004-B | planned proxy | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | No run or implementation yet | Build and audit the stream, then smoke and proxy seed 0 |
+| exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | planned proxy | T=512 for updates 0-383, then T=1024; test final loss at the same tokens, order, LR, and validation | No quality run yet; exp005 gate measured systems cost only | Run proxy seed 0; advance only for loss improvement >=0.004 |
 
@@ -276,12 +276,11 @@ future stream builder must preserve each selected token exactly once, handle
 documents that overlap selected-span boundaries explicitly, and avoid accidental
 duplication or omission at EOT boundaries.
 
-## Planned work
+## Current and planned work
 
 ### exp004-B — warmdown-aligned high-quality mixture
 
-**Status:** planned on 30 July 2026; not implemented, not run, and no training
-stream has been created.
+**Status:** completed proxy seed 0 on 30 July 2026; hypothesis killed.
 
 **Hypothesis.** At the same 937,426,944-token proxy budget, with every target
 token occurrence from the baseline proxy prefix used exactly once and with the
@@ -348,10 +347,44 @@ the baseline proxy prefix.
 - No NaN/OOM, no unexpected compile, and no more than 1% normalised runtime
   overhead from the pre-materialised data path.
 
-**Branch and run identity.** Implementation branch
-`exp004/late-quality-mixture`; W&B group, run directory, manifest, and result
-record use `exp004-B`. Paid smoke or proxy training still requires explicit
-approval after code review.
+**Implementation and provenance.** The pre-materialised stream builder,
+manifest validation, and guarded launcher were implemented from `603f5c0` on
+`exp004/late-quality-mixture`. The run used clean commit `d1205aa`, which
+contains that implementation. Its input-manifest file SHA-256 was
+`640bb47b146fea8207296ad6641e51e157953c24e6c8f66e6cc88e77142360a2`;
+the manifest payload SHA-256 was
+`2ca0d03b4040b3255a73a90099663bd6416c32c77c460343d5eac5059be069dc`.
+Local artifacts are in
+`nocap-runs-backup/exp004-B-results/runs/exp004-B-20260730T115702Z/`
+and the W&B run is
+`https://wandb.ai/m-obukhov-home/nocap-exp004/runs/upadrpkl`.
+
+**Result.** All accounting gates passed: 937,426,944 source and output target
+tokens, 1,788 updates, 77,677,516 score >=3 tokens, ten verified output shards,
+and the logged transition at update 1,404. The run completed without NaN/OOM.
+
+| Metric | exp004-B | Baseline seed 0 | Difference |
+|---|---:|---:|---:|
+| Final validation loss | **3.612175** | 3.597773 | **+0.014402** |
+| Training time | 7,370.19 s | 7,403.11 s | -0.44% cross-host |
+| Throughput | 127,192 tok/s | 126,626 tok/s | +0.45% cross-host |
+| Peak VRAM | 9,825 MiB | 9,821 MiB | +4 MiB |
+| End-to-end wall time | 7,548.94 s | 7,601.37 s | -0.69% cross-host |
+
+At $0.36/hour, the measured proxy wall-time cost was $0.755 (about $0.75);
+offline instance preparation and curriculum construction are excluded. The
+runtime differences are hardware context, not algorithmic speedups.
+
+**Dynamics and verdict.** Withholding score >=3 documents did not create a
+stable early gap: the validation delta versus baseline was +0.0685 at update
+128, approximately zero at 384, -0.0026 at 1,024, and +0.0283 at 1,280.
+Immediately after the enriched stage began it was +0.0179 at update 1,408; it
+remained worse by +0.0223 at 1,536, +0.0159 at 1,664, and +0.0144 at the end.
+The enriched warmdown therefore did not close the gap. Final loss exceeded the
+3.601773 kill threshold by 0.010402 and was 3.6 times the pre-registered 0.004
+decision margin worse than baseline. Do not run seeds 1/2 or promote this
+curriculum. This falsifies the tested timing and mixture, not the general claim
+that FineWeb-Edu scores may be useful in another sampling or filtering design.
 
 ### exp005 — staged sequence length, 512 to 1024
 
