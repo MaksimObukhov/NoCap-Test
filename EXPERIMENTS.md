@@ -63,7 +63,8 @@ proposal's cost but does not predict a loss improvement.
 | exp002 | completed measurement | Measured gradient noise scale along unchanged baseline | Mid-run B_crit about 106k vs 524,288 baseline batch; crossing about 910M tokens | Ramp premise retired; measurement informed exp003 |
 | exp003 | closed, partial proxy | Flat 16,384-token effective batch; LR 3.182e-4 | -0.3847 at 21.5% of budget; +17.6% overhead | Helpful direction, closed as out-of-scope hyperparameter work |
 | exp004-A | completed data analysis | Classified exact baseline FineWeb subset with FineWeb-Edu classifier | 8.2418% of selected tokens are in documents with rounded score >=3 | Evidence for a controlled ordering experiment, not evidence that it helps training |
-| exp004-B | planned proxy | Same documents and token count; place high-quality documents at the end | No run or implementation yet | Specify stream construction and success criterion before implementation |
+| exp004-B | planned proxy | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | No run or implementation yet | Build and audit the stream, then smoke and proxy seed 0 |
+| exp005 | planned proxy | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | No run or implementation yet | Measure compile/shape cost on the target 4090 before proxy |
 
 ## Completed experiments
 
@@ -276,33 +277,147 @@ duplication or omission at EOT boundaries.
 
 ## Planned work
 
-### exp004-B — late high-quality-data proxy
+### exp004-B — warmdown-aligned high-quality mixture
 
-**Status:** TODO — not implemented, not run, and no dataset has been created.
+**Status:** planned on 30 July 2026; not implemented, not run, and no training
+stream has been created.
 
-**Hypothesis.** At the same proxy token budget and with the same selected FineWeb
-documents used exactly once, training on lower-quality documents first and the
-exp004-A high-quality partition last will improve final proxy validation loss
-relative to the baseline ordering. The mechanism to test is late-stage data
-mixture, not data removal or an increase in high-quality-token count.
+**Hypothesis.** At the same 937,426,944-token proxy budget, with every target
+token occurrence from the baseline proxy prefix used exactly once and with the
+model, LR schedule, effective batch, update count, and validation unchanged,
+moving all FineWeb-Edu `int_score >= 3` tokens into an enriched mixture spanning
+the complete warmdown will improve final proxy seed-0 validation loss by at
+least 0.004. The mechanism under test is *when* scarce high-scoring data is
+consumed, not filtering, repetition, or adding data.
 
-**Planned intervention.** Keep the exact 2,499,805,184 selected-token set and
-the baseline volume. Preserve document-internal token order; emit the
-lower-quality partition first and the 206,027,733 high-quality selected tokens
-at the end. The high-quality tail is therefore about 8.24% of the token budget.
-This is a provisional design statement, not an implementation specification.
+**Why this is not a pure high-quality tail.** The proxy prefix contains
+77,677,516 score >=3 target tokens, or 8.2862% of the budget. A contiguous tail
+would start around update 1,640, where LR has already fallen below 39% of peak,
+and those tokens would see only about 19% of peak LR on average. Distributing
+them over the full warmdown gives them about 50% of peak LR on average while
+still making the late mixture substantially richer. This avoids changing the
+baseline LR schedule to rescue the curriculum.
 
-**TODO before implementation.** On `research/experiments`, add a docs-only
-pre-registration that fixes: (1) the exact stream-construction rule for
-documents crossing selected spans and for shifted targets; (2) a hash, token
-count, document count, and per-partition accounting proving same-data-once;
-(3) whether the high-quality tail is contiguous or has a pre-registered
-transition; (4) the proxy success threshold, timing/VRAM guardrails, baseline
-comparison, and kill rule. Then create `exp004/late-quality-tail` from that
-commit. Do not start paid training without explicit approval.
+**Pre-registered stream.**
 
-**Success criterion to pre-register.** The future run must first demonstrate
-identical selected-token accounting. Only then can proxy seed 0 be judged by
-final validation loss against 3.59777 and by wall-clock/VRAM against exp000. A
-better loss alone would not justify a conclusion if the data set, token count,
-or loader semantics differ.
+| Stage | Updates | Target tokens | Contents |
+|---|---:|---:|---|
+| general | 0-1403 | 736,100,352 | score 0-2 target occurrences in original order |
+| enriched warmdown | 1404-1787 | 201,326,592 | all 77,677,516 score >=3 tokens plus 123,649,076 remaining score 0-2 tokens |
+
+The warmdown mixture is therefore 38.5828% score >=3 and 61.4172% score 0-2.
+The builder will preserve order within the high and non-high queues and merge
+the two queues deterministically in proportion to their final token totals.
+It may split only the one non-high document required to land exactly on the
+update-1404 boundary, plus the already partial document at the end of the
+baseline proxy prefix. Document-internal order within every emitted segment is
+preserved. No selected target occurrence may be duplicated or omitted.
+
+The output will be ordinary pre-materialised `.bin` shards consumed by the
+unchanged fixed-shape loader. Each output shard will contain one context-only
+prefix followed by a multiple of the 16,384-token micro-batch size, so shard
+tails cannot silently lose targets. The target stream remains exactly
+937,426,944 tokens / 1,788 updates. A manifest must record the source selection
+hash, score-file hash, per-stage and per-score counts, split-document details,
+source-span coverage, output shard hashes, and the exact transition.
+
+**Controlled variables.** Training remains B=16, T=1024, accumulation=32,
+524,288 tokens/update, 1,788 updates, warmup=96, warmdown=384, peak LR=0.0018,
+seed 0, and the unchanged 1,048,576-token T=1024 validation. The data shape does
+not change at the stage boundary, so any `torch.compile` recompile is a failure,
+not an expected cost.
+
+**Expected dynamics and falsifiers.** Validation may be worse before update
+1,404 because all high-scoring data is deliberately withheld; that is not an
+early stopping signal. Supporting evidence is a closing or crossing validation
+gap during warmdown. The sign of the train-loss jump at the transition is not
+pre-registered because FineWeb-Edu score is not an example-difficulty measure.
+The mechanism is weakened if the gain appears before the enriched stage, if a
+recompile or loader stall occurs at the boundary, or if accounting differs from
+the baseline proxy prefix.
+
+**Success and stopping criteria.**
+
+- Accounting must pass before loss is interpreted.
+- Final seed-0 validation `<= 3.593773` (delta <= -0.004 vs 3.597773) passes
+  the quality gate and earns proxy seeds 1/2.
+- Final validation `>= 3.601773` (delta >= +0.004) kills the hypothesis.
+- The interval between those thresholds is inconclusive and does not
+  automatically earn more seeds.
+- No NaN/OOM, no unexpected compile, and no more than 1% normalised runtime
+  overhead from the pre-materialised data path.
+
+**Branch and run identity.** Implementation branch
+`exp004/late-quality-mixture`; W&B group, run directory, manifest, and result
+record use `exp004-B`. Paid smoke or proxy training still requires explicit
+approval after code review.
+
+### exp005 — staged sequence length, 512 to 1024
+
+**Status:** planned on 30 July 2026; not implemented or run.
+
+**Hypothesis.** With identical target-token order, token budget, effective
+batch, update count, LR schedule, and T=1024 validation, using T=512 for the
+first half of the proxy and T=1024 for the second half will reduce normalised
+end-to-end wall-time by at least 1% without worsening final proxy seed-0
+validation by more than 0.004.
+
+**Pre-registered schedule.**
+
+| Stage | Updates | T | Micro-batch B | Accumulation | Tokens/update |
+|---|---:|---:|---:|---:|---:|
+| short | 0-895 | 512 | 32 | 32 | 524,288 |
+| long | 896-1787 | 1024 | 16 | 32 | 524,288 |
+
+In both stages `B * T = 16,384`, so the loader advances by the same number of
+flat source tokens per micro-batch and the target-token order is identical to
+exp000. Optimizer updates, AdamW timescales, peak LR, warmup/warmdown positions,
+and total tokens are unchanged. Validation always uses the original T=1024
+layout; the transition at update 896 coincides with an existing validation
+boundary.
+
+**Profiler prior, not a result.** At T=1024 the measured full update is 4.030 s,
+of which FlashAttention forward+backward is about 355 ms. At fixed B*T, halving
+T approximately halves attention work but leaves the dominant token-linear
+GEMMs unchanged. The resulting prior is about 3.85 s/update at T=512, +4.6%
+steady throughput, and roughly 159 seconds gross proxy saving for 896 short
+updates. One shape recompile could cost around one minute and consume much of
+that saving.
+
+**Mandatory pre-proxy systems gate.** On the target RTX 4090, a short same-host
+FineWeb run must measure cold first-call/compile latency, transition recompile
+latency, steady T=512 and T=1024 medians, peak VRAM, graph breaks, and recompile
+logs. The run records `torch._dynamo.utils.compile_times()` and
+`TORCH_LOGS=recompiles`. Kill before proxy if the measured transition cost
+consumes the projected saving, T=512 is less than 3% faster in steady state,
+the normalised projected net saving is below 1%, or compilation falls back to
+eager execution.
+
+**Wall-time definition.** Primary time starts immediately before the first
+compiled model call and ends after final validation. It includes lazy initial
+compile, the T=512 -> T=1024 recompile, optimizer steps, validation, data
+transitions, scheduled checkpoints, and in-loop logging. Offline setup and data
+download are excluded. Steady per-stage medians and compile latency are reported
+separately. Because two rented cards remain different systems even when BF16
+TFLOPS and clocks match, the speed claim uses a same-host timing calibration
+and a within-run T=1024 counterfactual; cross-instance wall-time is supporting
+context only.
+
+**Success and stopping criteria.**
+
+- Exact 937,426,944 tokens, 1,788 updates, unchanged target order, LR, and
+  validation accounting are mandatory.
+- Final validation must be `<= 3.601773`, the +0.004 non-inferiority boundary
+  versus baseline seed 0.
+- Normalised end-to-end wall-time, including compile/recompile, must improve by
+  at least 1% against the same-host counterfactual.
+- Loss worse than 3.601773, net speedup below 1%, OOM/NaN, recompile storm, or
+  eager fallback kills the schedule.
+- Passing seed 0 earns proxy seeds 1/2 before any full run.
+
+**Branch and sequencing.** Implementation branch
+`exp005/sequence-length-512-1024`. It is independent of exp004-B and may run on
+a second instance at the same time, but it is implemented only after exp004-B
+has been reviewed, committed, and launched. The two modifications are never
+combined in one training run. Any paid gate, smoke, or proxy requires explicit
+approval after code review.
