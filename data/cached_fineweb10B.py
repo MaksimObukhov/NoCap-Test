@@ -1,4 +1,5 @@
 import os
+import inspect
 
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
@@ -14,6 +15,19 @@ class VisibleDownloadProgress(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def download_kwargs():
+    kwargs = {
+        "repo_id": "kjj0/fineweb10B-gpt2",
+        "repo_type": "dataset",
+    }
+    # huggingface_hub 0.30.2 does not expose this keyword on
+    # hf_hub_download; newer releases do. Keep the pinned remote version
+    # working while retaining visible byte progress where the API supports it.
+    if "tqdm_class" in inspect.signature(hf_hub_download).parameters:
+        kwargs["tqdm_class"] = VisibleDownloadProgress
+    return kwargs
+
+
 def get(fname, *, file_index, total_files):
     local_dir = os.path.join(os.path.dirname(__file__), "fineweb10B")
     local_path = os.path.join(local_dir, fname)
@@ -25,11 +39,9 @@ def get(fname, *, file_index, total_files):
 
     print(f"{prefix} downloading: {fname}", flush=True)
     hf_hub_download(
-        repo_id="kjj0/fineweb10B-gpt2",
         filename=fname,
-        repo_type="dataset",
         local_dir=local_dir,
-        tqdm_class=VisibleDownloadProgress,
+        **download_kwargs(),
     )
     size_gib = os.path.getsize(local_path) / 1024**3
     print(f"{prefix} ready:       {fname} ({size_gib:.2f} GiB)", flush=True)
