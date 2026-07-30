@@ -46,5 +46,6 @@ exec ./run.sh "$BASE_MODE" "$SEED" "$OUTPUT_DIR" \
   --train_batch_size_after 16 \
   --train_sequence_length_after 1024 \
   --validation_sequence_length 1024 \
+  --compile_shape_policy static \
   "${EXTRA_ARGS[@]}" \
   "${@:4}"

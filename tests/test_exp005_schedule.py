@@ -31,6 +31,12 @@ gate = import_from_path(
 
 
 class SequenceLengthScheduleTest(unittest.TestCase):
+    def test_compile_shape_policy_maps_to_torch_compile_dynamic_flag(self):
+        self.assertIsNone(trainer.compile_dynamic_from_policy("auto"))
+        self.assertIs(trainer.compile_dynamic_from_policy("static"), False)
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            trainer.compile_dynamic_from_policy("invalid")
+
     def test_proxy_schedule_preserves_tokens_and_transition(self):
         stages = trainer.build_train_shape_stages(
             num_iterations=1788,

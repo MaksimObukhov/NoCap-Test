@@ -24,6 +24,7 @@ bash run.sh smoke 0 "$GATE_DIR/fixed-t1024" \
   --batch_size 16 \
   --sequence_length 1024 \
   --validation_sequence_length 1024 \
+  --compile_shape_policy static \
   --num_iterations "$GATE_STEPS" \
   --warmup_iters 0 \
   --warmdown_iters 0 \
@@ -40,6 +41,7 @@ bash run.sh smoke 0 "$GATE_DIR/scheduled" \
   --train_batch_size_after 16 \
   --train_sequence_length_after 1024 \
   --validation_sequence_length 1024 \
+  --compile_shape_policy static \
   --num_iterations "$GATE_STEPS" \
   --warmup_iters 0 \
   --warmdown_iters 0 \
