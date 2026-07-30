@@ -5,6 +5,7 @@ import math
 import glob
 import json
 import random
+import statistics
 import subprocess
 from dataclasses import dataclass
 
@@ -265,12 +266,30 @@ class DistributedDataLoader:
         return {
             "current_shard": self.current_shard,
             "current_position": self.current_position,
+            "batch_size": self.B,
+            "sequence_length": self.T,
         }
 
     def load_state_dict(self, state):
+        checkpoint_batch_size = state.get("batch_size", self.B)
+        checkpoint_sequence_length = state.get("sequence_length", self.T)
+        if checkpoint_batch_size * checkpoint_sequence_length != self.B * self.T:
+            raise ValueError(
+                "checkpoint loader token count does not match active stage"
+            )
         self.current_shard = state["current_shard"]
         self.current_position = state["current_position"]
         self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def set_batch_shape(self, B, T):
+        if B <= 0 or T <= 0:
+            raise ValueError("batch size and sequence length must be positive")
+        if B * T != self.B * self.T:
+            raise ValueError(
+                "shape transition must preserve target tokens per micro-batch"
+            )
+        self.B = B
+        self.T = T
 
     def advance(self):  # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
@@ -295,6 +314,81 @@ class DistributedDataLoader:
 # int main
 
 VAL_TOKENS = 1_048_576  # how many tokens of validation data. It's important to keep this fixed for consistent comparisons
+
+
+@dataclass(frozen=True)
+class TrainShapeStage:
+    index: int
+    name: str
+    start_step: int
+    end_step_exclusive: int
+    batch_size: int
+    sequence_length: int
+
+    @property
+    def tokens_per_micro_batch(self):
+        return self.batch_size * self.sequence_length
+
+
+def build_train_shape_stages(
+    *,
+    num_iterations,
+    initial_batch_size,
+    initial_sequence_length,
+    transition_step,
+    final_batch_size,
+    final_sequence_length,
+):
+    if initial_batch_size <= 0 or initial_sequence_length <= 0:
+        raise ValueError("initial training shape must be positive")
+    if transition_step < 0:
+        if final_batch_size != 0 or final_sequence_length != 0:
+            raise ValueError("final shape requires a non-negative transition step")
+        return [
+            TrainShapeStage(
+                index=0,
+                name="fixed",
+                start_step=0,
+                end_step_exclusive=num_iterations,
+                batch_size=initial_batch_size,
+                sequence_length=initial_sequence_length,
+            )
+        ]
+    if not 0 < transition_step < num_iterations:
+        raise ValueError("shape transition must be inside the training run")
+    if final_batch_size <= 0 or final_sequence_length <= 0:
+        raise ValueError("final training shape must be positive")
+    if (
+        initial_batch_size * initial_sequence_length
+        != final_batch_size * final_sequence_length
+    ):
+        raise ValueError("shape schedule must preserve tokens per micro-batch")
+    return [
+        TrainShapeStage(
+            index=0,
+            name="short",
+            start_step=0,
+            end_step_exclusive=transition_step,
+            batch_size=initial_batch_size,
+            sequence_length=initial_sequence_length,
+        ),
+        TrainShapeStage(
+            index=1,
+            name="long",
+            start_step=transition_step,
+            end_step_exclusive=num_iterations,
+            batch_size=final_batch_size,
+            sequence_length=final_sequence_length,
+        ),
+    ]
+
+
+def train_shape_stage_for_step(stages, step, num_iterations):
+    active_step = min(step, num_iterations - 1)
+    for stage in stages:
+        if stage.start_step <= active_step < stage.end_step_exclusive:
+            return stage
+    raise ValueError(f"training shape schedule does not cover step {active_step}")
 
 
 def print0(*args, **kwargs):
@@ -380,6 +474,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sequence_length", type=int, default=64, help="sequence length"
     )
+    parser.add_argument(
+        "--train_shape_transition_step",
+        type=int,
+        default=-1,
+        help="optimizer update where the second training shape starts; -1 disables",
+    )
+    parser.add_argument("--train_batch_size_after", type=int, default=0)
+    parser.add_argument("--train_sequence_length_after", type=int, default=0)
+    parser.add_argument(
+        "--validation_sequence_length",
+        type=int,
+        default=0,
+        help="fixed validation T; 0 uses the initial training T",
+    )
     parser.add_argument("--seed", type=int, default=0)
     # workload (number of steps)
     parser.add_argument(
@@ -444,8 +552,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     B, T = args.batch_size, args.sequence_length
-    assert args.model in {"d12", "d24", "d36", "d48"}
     assert args.num_iterations > 0
+    train_shape_stages = build_train_shape_stages(
+        num_iterations=args.num_iterations,
+        initial_batch_size=B,
+        initial_sequence_length=T,
+        transition_step=args.train_shape_transition_step,
+        final_batch_size=args.train_batch_size_after,
+        final_sequence_length=args.train_sequence_length_after,
+    )
+    validation_T = args.validation_sequence_length or T
+    assert args.model in {"d12", "d24", "d36", "d48"}
+    assert validation_T > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
     assert args.save_every >= 0
     assert args.profile_wait_steps >= 0
@@ -490,6 +608,10 @@ if __name__ == "__main__":
             "batch_size",
             "grad_accumulation_steps",
             "sequence_length",
+            "train_shape_transition_step",
+            "train_batch_size_after",
+            "train_sequence_length_after",
+            "validation_sequence_length",
             "num_iterations",
             "learning_rate",
             "warmup_iters",
@@ -567,16 +689,46 @@ if __name__ == "__main__":
     print0(f"using device: {device} ({metadata['gpu_name']})")
     print0(f"run: {args.run_name} | seed: {args.seed} | output: {args.output_dir}")
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
+    tokens_per_iter = (
+        train_shape_stages[0].tokens_per_micro_batch
+        * ddp_world_size
+        * args.grad_accumulation_steps
+    )
+    for stage in train_shape_stages:
+        stage_tokens_per_iter = (
+            stage.tokens_per_micro_batch
+            * ddp_world_size
+            * args.grad_accumulation_steps
+        )
+        if stage_tokens_per_iter != tokens_per_iter:
+            raise ValueError("all training stages must preserve tokens per update")
     print0(f"tokens per iteration: {tokens_per_iter:,}")
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    tokens_per_iter_val = args.val_batch_size * T * ddp_world_size
+    initial_loader_step = (
+        int(resume_checkpoint["next_step"])
+        if resume_checkpoint is not None
+        else 0
+    )
+    initial_loader_stage = train_shape_stage_for_step(
+        train_shape_stages, initial_loader_step, args.num_iterations
+    )
+    train_loader = DistributedDataLoader(
+        args.input_bin,
+        initial_loader_stage.batch_size,
+        initial_loader_stage.sequence_length,
+        ddp_rank,
+        ddp_world_size,
+    )
+    tokens_per_iter_val = args.val_batch_size * validation_T * ddp_world_size
     assert VAL_TOKENS % tokens_per_iter_val == 0
     val_steps = VAL_TOKENS // tokens_per_iter_val
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
+        args.input_val_bin,
+        args.val_batch_size,
+        validation_T,
+        ddp_rank,
+        ddp_world_size,
     )
 
     num_vocab = 50257
@@ -639,6 +791,46 @@ if __name__ == "__main__":
     def elapsed_wall_seconds():
         return previous_wall_time_seconds + time.perf_counter() - session_wall_start
 
+    compile_reports = (
+        list(resume_checkpoint.get("compile_reports", []))
+        if resume_checkpoint is not None
+        else []
+    )
+
+    def record_compile_report(label, step):
+        try:
+            report = str(torch._dynamo.utils.compile_times())
+        except Exception as error:
+            report = f"compile_times unavailable: {type(error).__name__}: {error}"
+        record = {
+            "event": "compile_report",
+            "label": label,
+            "step": step,
+            "wall_time_seconds": elapsed_wall_seconds(),
+            "compile_times": report,
+        }
+        compile_reports.append(record)
+        log_local(record)
+
+    def dynamo_counters_snapshot():
+        counters = {}
+        for category, values in torch._dynamo.utils.counters.items():
+            counters[str(category)] = {
+                str(name): int(value) for name, value in values.items()
+            }
+        return counters
+
+    saved_stage_times = (
+        resume_checkpoint.get("stage_step_times_ms", {})
+        if resume_checkpoint is not None
+        else {}
+    )
+    stage_step_times_ms = {
+        str(stage.index): list(saved_stage_times.get(str(stage.index), []))
+        for stage in train_shape_stages
+    }
+    current_train_shape_stage_index = None
+
     def save_checkpoint(next_step):
         if not master_process:
             return
@@ -661,6 +853,8 @@ if __name__ == "__main__":
             },
             "training_time_ms": training_time_ms,
             "wall_time_seconds": elapsed_wall_seconds(),
+            "compile_reports": compile_reports,
+            "stage_step_times_ms": stage_step_times_ms,
             "last_val_loss": final_val_loss,
             "args": vars(args),
             "metadata": metadata,
@@ -717,8 +911,49 @@ if __name__ == "__main__":
 
     for step in range(start_step, args.num_iterations + 1):
         last_step = step == args.num_iterations
+        train_shape_stage = train_shape_stage_for_step(
+            train_shape_stages, step, args.num_iterations
+        )
+        if train_shape_stage.index != current_train_shape_stage_index:
+            train_loader.set_batch_shape(
+                train_shape_stage.batch_size,
+                train_shape_stage.sequence_length,
+            )
+            expected_elements = train_shape_stage.tokens_per_micro_batch
+            if x.numel() != expected_elements or y.numel() != expected_elements:
+                raise ValueError("prefetched batch does not match stage token count")
+            x = x.reshape(
+                train_shape_stage.batch_size,
+                train_shape_stage.sequence_length,
+            )
+            y = y.reshape(
+                train_shape_stage.batch_size,
+                train_shape_stage.sequence_length,
+            )
+            current_train_shape_stage_index = train_shape_stage.index
+            shape_record = {
+                "event": "train_shape_stage",
+                "step": step,
+                "tokens_seen": step * tokens_per_iter,
+                "train_shape_stage_index": train_shape_stage.index,
+                "train_shape_stage_name": train_shape_stage.name,
+                "train_batch_size": train_shape_stage.batch_size,
+                "train_sequence_length": train_shape_stage.sequence_length,
+                "tokens_per_micro_batch": train_shape_stage.tokens_per_micro_batch,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+            print0(
+                f"training shape stage {train_shape_stage.index}: "
+                f"B={train_shape_stage.batch_size}, "
+                f"T={train_shape_stage.sequence_length} at update {step}"
+            )
+            log_local(shape_record)
+            if wandb_run is not None:
+                wandb_run.log(shape_record)
 
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
+            torch.cuda.synchronize()
+            validation_start = time.perf_counter()
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -729,12 +964,16 @@ if __name__ == "__main__":
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
+            torch.cuda.synchronize()
+            validation_time_ms = 1000 * (time.perf_counter() - validation_start)
             final_val_loss = val_loss.item()
             validation_record = {
                 "event": "validation",
                 "step": step,
                 "tokens_seen": step * tokens_per_iter,
                 "val_loss": final_val_loss,
+                "validation_time_ms": validation_time_ms,
+                "validation_sequence_length": validation_T,
                 "training_time_seconds": training_time_ms / 1000,
                 "wall_time_seconds": elapsed_wall_seconds(),
             }
@@ -744,6 +983,8 @@ if __name__ == "__main__":
             log_local(validation_record)
             if wandb_run is not None:
                 wandb_run.log(validation_record)
+            if step == 0 or step == args.train_shape_transition_step:
+                record_compile_report(f"after_validation_step_{step}", step)
 
         if last_step:
             break
@@ -771,6 +1012,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         step_time_ms = 1000 * (time.perf_counter() - train_step_start)
         training_time_ms += step_time_ms
+        stage_step_times_ms[str(train_shape_stage.index)].append(step_time_ms)
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()
@@ -783,6 +1025,9 @@ if __name__ == "__main__":
             "train_loss": lossf,
             "learning_rate": lr,
             "step_time_ms": step_time_ms,
+            "train_shape_stage_index": train_shape_stage.index,
+            "train_batch_size": train_shape_stage.batch_size,
+            "train_sequence_length": train_shape_stage.sequence_length,
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
@@ -795,6 +1040,11 @@ if __name__ == "__main__":
         log_local(train_record)
         if wandb_run is not None:
             wandb_run.log(train_record)
+        if step == train_shape_stage.start_step:
+            record_compile_report(
+                f"after_first_{train_shape_stage.name}_train_step",
+                completed_steps,
+            )
 
         if args.save_every > 0 and completed_steps % args.save_every == 0:
             save_checkpoint(completed_steps)
@@ -803,8 +1053,31 @@ if __name__ == "__main__":
             # One profiler step is one complete optimizer update, including accumulation.
             profiler.step()
 
+    primary_wall_time_seconds = elapsed_wall_seconds()
+
     if profiler is not None:
         profiler.stop()
+
+    stage_timing_summary = []
+    for stage in train_shape_stages:
+        values = stage_step_times_ms[str(stage.index)]
+        steady_values = values[1:] if len(values) > 1 else values
+        stage_timing_summary.append(
+            {
+                "index": stage.index,
+                "name": stage.name,
+                "start_step": stage.start_step,
+                "end_step_exclusive": stage.end_step_exclusive,
+                "batch_size": stage.batch_size,
+                "sequence_length": stage.sequence_length,
+                "measured_steps": len(values),
+                "first_step_time_ms": values[0] if values else None,
+                "median_step_time_ms": statistics.median(values) if values else None,
+                "steady_median_step_time_ms": (
+                    statistics.median(steady_values) if steady_values else None
+                ),
+            }
+        )
 
     peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
     total_tokens = args.num_iterations * tokens_per_iter
@@ -821,8 +1094,12 @@ if __name__ == "__main__":
         "final_val_loss": final_val_loss,
         "num_iterations": args.num_iterations,
         "tokens_seen": total_tokens,
+        "validation_sequence_length": validation_T,
+        "train_shape_stages": stage_timing_summary,
+        "compile_reports": compile_reports,
+        "dynamo_counters": dynamo_counters_snapshot(),
         "training_time_seconds": training_time_seconds,
-        "wall_time_seconds": elapsed_wall_seconds(),
+        "wall_time_seconds": primary_wall_time_seconds,
         "tokens_per_second": total_tokens / training_time_seconds,
         "peak_memory_mib": peak_memory_mib,
     }
