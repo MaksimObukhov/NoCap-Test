@@ -65,7 +65,7 @@ proposal's cost but does not predict a loss improvement.
 | exp004-A | completed data analysis | Classified exact baseline FineWeb subset with FineWeb-Edu classifier | 8.2418% of selected tokens are in documents with rounded score >=3 | Evidence for a controlled ordering experiment, not evidence that it helps training |
 | exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
-| exp006 | planned proxy | T=512 for updates 0-383, then T=1024; test final loss at the same tokens, order, LR, and validation | No quality run yet; exp005 gate measured systems cost only | Run proxy seed 0; advance only for loss improvement >=0.004 |
+| exp006 | stopped after proxy s0, inconclusive | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 
 ## Completed experiments
 
@@ -482,7 +482,8 @@ The separate loss-per-token question is pre-registered below as exp006.
 
 ### exp006 — sequence-length curriculum for loss per token
 
-**Status:** planned on 30 July 2026; no quality proxy run yet.
+**Status:** proxy seed 0 completed on 30 July 2026; stopped as inconclusive
+without advancing to seeds 1/2.
 
 **Question separated from exp005.** The exp005 systems gate established that
 the discrete shape schedule is not a net wall-time optimisation at proxy scale.
@@ -555,3 +556,49 @@ Reuse the reviewed two-shape mechanism, but set the transition explicitly to
 update 384. Exp006 remains independent of exp004-B and uses the unchanged
 baseline FineWeb stream. Paid proxy seed 0 requires a clean pushed SHA,
 recoverable local artifacts plus W&B, and explicit launch approval.
+
+**Proxy seed-0 result.** The run completed from clean commit `efe1d89` with
+the exact pre-registered 937,426,944 target tokens and 1,788 optimizer updates.
+The uploaded summary, stdout, and metrics agree on the run identity and final
+measurements.
+
+| Metric | exp006 seed 0 |
+|---|---:|
+| Final T=1024 validation loss | 3.600870 |
+| Delta versus baseline seed 0 (3.597773) | +0.003097 |
+| Delta versus baseline proxy mean (3.599351) | +0.001520 |
+| Training time | 7,219.89 s (2.006 h) |
+| End-to-end wall-time | 7,395.88 s (2.054 h) |
+| Throughput, training-time denominator | 129,839 tok/s |
+| Peak allocated memory | 9,820 MiB |
+| TorchDynamo unique graphs | 6 |
+| Recorded cost | not present in the uploaded artifacts |
+
+The fixed-T=1024 validation trajectory was:
+`10.941801` at update 0, `5.891355` at 128, `5.123504` at 256,
+`4.797851` immediately before the transition at 384, `4.285623` at 512,
+`4.127798` at 640, `4.035853` at 768, `3.959792` at 896, `3.907623` at
+1,024, `3.855236` at 1,152, `3.816961` at 1,280, `3.786529` at 1,408,
+`3.715722` at 1,536, `3.645185` at 1,664, and `3.600870` at 1,788.
+There was no unrecovered validation-loss spike: the first post-transition
+validation was lower. Because validation is spaced 128 updates apart, this
+cannot exclude a brief transition transient.
+
+The median steady optimizer step was 3,880.88 ms at T=512 and 3,977.19 ms at
+T=1024. The first T=1024 training step took 48.82 s, about 44.84 s above its
+steady-state median, consistent with the expected new-shape compilation. The
+primary 7,395.88 s wall-time includes initial lazy compilation, transition
+recompilation, validation, and training. It must not be presented as a speedup
+against a baseline run from another rented host.
+
+**Verdict.** The final loss is inside the pre-registered inconclusive interval
+`(3.593773, 3.601773)`, but the observed direction is worse rather than better.
+The run did not reach the baseline seed-0 final loss at any logged validation
+point. Therefore seed 0 provides no positive evidence for the hypothesised
+loss-per-token improvement of at least 0.004, and exp006 stops without spending
+compute on seeds 1/2. This quality result does not change exp005's failed
+systems verdict.
+
+**Artifacts.** Local uploaded bundle:
+`nocap-runs-backup/exp006-proxy-20260730/proxy-seed-0/`. W&B:
+<https://wandb.ai/m-obukhov-home/nocap-baseline/runs/k8v23t2i>.
