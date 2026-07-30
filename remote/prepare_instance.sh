@@ -11,8 +11,9 @@ Usage: prepare_instance.sh [--skip-dataset]
 
 Runs, in order:
   1. Instance, repository, Python, CUDA, and disk checks.
-  2. BF16 GPU throughput gate.
-  3. FineWeb download and validation, unless --skip-dataset is supplied.
+  2. Install the pinned W&B client when needed.
+  3. BF16 GPU throughput gate.
+  4. FineWeb download and validation, unless --skip-dataset is supplied.
 
 Useful overrides:
   REMOTE_PYTHON=/venv/main/bin/python
@@ -36,19 +37,23 @@ LOG_DIR="${REMOTE_LOG_DIR:-$REPO_ROOT/runs/remote-prep-$(date -u +%Y%m%dT%H%M%SZ
 mkdir -p "$LOG_DIR"
 echo "logs: $LOG_DIR"
 
-echo "=== 1/3 Instance checks ==="
+echo "=== 1/4 Instance checks ==="
 "$SCRIPT_DIR/check_instance.sh" 2>&1 | tee "$LOG_DIR/check_instance.log"
 
 echo
-echo "=== 2/3 BF16 GPU benchmark ==="
+echo "=== 2/4 W&B client ==="
+"$SCRIPT_DIR/ensure_wandb.sh" 2>&1 | tee "$LOG_DIR/ensure_wandb.log"
+
+echo
+echo "=== 3/4 BF16 GPU benchmark ==="
 "$SCRIPT_DIR/benchmark_gpu.sh" 2>&1 | tee "$LOG_DIR/benchmark_gpu.log"
 
 if (( SKIP_DATASET == 1 )); then
   echo
-  echo "=== 3/3 FineWeb download skipped ==="
+  echo "=== 4/4 FineWeb download skipped ==="
 else
   echo
-  echo "=== 3/3 FineWeb download ==="
+  echo "=== 4/4 FineWeb download ==="
   "$SCRIPT_DIR/download_fineweb.sh" 2>&1 | tee "$LOG_DIR/download_fineweb.log"
 fi
 
