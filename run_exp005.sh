@@ -34,7 +34,7 @@ if [[ -z "$OUTPUT_DIR" ]]; then
   OUTPUT_DIR="runs/exp005-${RUN_TIMESTAMP}/${MODE}-seed-${SEED}"
 fi
 
-export WANDB_PROJECT="${WANDB_PROJECT:-nocap-exp005}"
+export WANDB_PROJECT="${WANDB_PROJECT:-nocap-baseline}"
 export WANDB_GROUP="${WANDB_GROUP:-exp005}"
 export TORCH_LOGS="${TORCH_LOGS:-recompiles,graph_breaks}"
 
