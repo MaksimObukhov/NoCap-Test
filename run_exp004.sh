@@ -26,7 +26,7 @@ fi
 
 export TRAIN_INPUT_BIN="$CURRICULUM_DIR/exp004_train_*.bin"
 export TRAIN_INPUT_MANIFEST="$MANIFEST"
-export WANDB_PROJECT="${WANDB_PROJECT:-nocap-exp004}"
+export WANDB_PROJECT="${WANDB_PROJECT:-nocap-baseline}"
 export WANDB_GROUP="${WANDB_GROUP:-exp004-B}"
 
 exec ./run.sh "$MODE" "$SEED" "$OUTPUT_DIR" \
