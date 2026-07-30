@@ -17,7 +17,8 @@ Runs, in order:
 Useful overrides:
   REMOTE_PYTHON=/venv/main/bin/python
   GPU_BENCH_SECONDS=600
-  GPU_MIN_TFLOPS=120
+  GPU_MIN_TFLOPS=160
+  GPU_MIN_SM_CLOCK_MHZ=2350
   MIN_FREE_GIB=20
   REMOTE_LOG_DIR=/path/to/log/directory
 EOF
