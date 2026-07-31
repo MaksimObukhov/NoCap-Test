@@ -65,11 +65,19 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
+        self.n_kv_head = (
+            config.n_head if config.n_kv_head is None else config.n_kv_head
+        )
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        assert 0 < self.n_kv_head <= self.n_head
+        assert self.n_head % self.n_kv_head == 0
+        self.kv_dim = self.n_kv_head * self.head_dim
+        # Query keeps all heads; grouped keys and values use fewer heads.
+        self.c_attn = nn.Linear(
+            self.n_embd, self.n_embd + 2 * self.kv_dim, bias=False
+        )
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
@@ -80,15 +88,19 @@ class CausalSelfAttention(nn.Module):
         )  # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
+        q, k, v = qkv.split((self.n_embd, self.kv_dim, self.kv_dim), dim=2)
+        k = k.view(B, T, self.n_kv_head, self.head_dim)
         q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_kv_head, self.head_dim)
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=True,
+            enable_gqa=self.n_kv_head != self.n_head,
         )
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
@@ -136,6 +148,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_kv_head: int | None = None
 
 
 class GPT(nn.Module):
@@ -581,7 +594,13 @@ if __name__ == "__main__":
 
     num_vocab = 50257
     model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
+        "d12": GPTConfig(
+            vocab_size=num_vocab,
+            n_layer=12,
+            n_head=12,
+            n_embd=768,
+            n_kv_head=4,
+        ),
         "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
         "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
