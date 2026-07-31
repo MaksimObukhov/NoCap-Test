@@ -104,7 +104,7 @@ proposal's cost but does not predict a loss improvement.
 | exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
-| exp007 | planned systems benchmark | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | Pending exact-shape RTX 4090 benchmark | Require at least 3% faster full training updates before defining a proxy |
+| exp007 | completed systems benchmark | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Systems gate passed; proxy remains unapproved pending a separate quality hypothesis |
 
 ## Completed experiments
 
@@ -644,7 +644,8 @@ systems verdict.
 
 ### exp007 — narrower MLP (4D -> 3D)
 
-**Status:** planned systems benchmark; no proxy or paid training approved.
+**Status:** systems benchmark completed on 31 July 2026; passed. No proxy or
+paid training approved.
 
 **Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
 accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
@@ -690,6 +691,41 @@ before interpreting timing.
 - A passing benchmark promotes exp007 only to a proxy candidate. Before paid
   proxy seed 0, separately pre-register the loss/non-inferiority and
   compile-inclusive time-to-target criteria.
+
+**Measured systems result.** Implementation commit `bc8ebb5` was compared with
+its 4D parent `0430323` on one RTX 4090 using PyTorch 2.11.0+cu128. Each timing
+run used 50 updates at the exact baseline shape. After excluding the first five
+updates, the median full-update time was 3,984.11 ms for 4D and 3,604.36 ms for
+3D: a 10.54% same-host steady-state speedup, comfortably above the 3% gate.
+Peak allocated memory fell from 9,822 MiB to 9,030 MiB.
+
+The estimated compile/warm-up excess was 152.03 s for baseline and 165.75 s for
+exp007, so the variant paid 13.72 s of additional one-time overhead. Applying
+the measured update-time difference to 1,788 proxy updates gives 678.99 s of
+gross steady saving and 665.27 s of projected net training-time saving after
+that extra overhead. This projection excludes validation/checkpoint costs and
+does not assume that 3D reaches the same loss in the same number of tokens.
+
+One post-warm-up complete update from each run was then profiled. Profiler step
+time fell from 4.006 s to 3.624 s (9.54%). `aten::mm` fell from 2.626 s to
+2.355 s (10.32%, or 271 ms) with the same 4,704 calls; aggregated GELU kernels
+fell from 199.39 ms to 147.36 ms, while FlashAttention forward plus backward
+was essentially unchanged at 348.47 ms versus 346.44 ms. The narrower GEMMs
+and activations therefore explain most of the observed full-step improvement.
+Both runs retained FlashAttention, showed the same expected one-time Rotary
+cache recompile, and had no eager fallback, recompile storm, OOM, NaN, or
+unhealthy early loss.
+
+**Verdict.** The systems hypothesis passed and its causal mechanism is supported
+by the profile. The only principal unresolved question is quality retention:
+whether the smaller MLP needs few enough additional tokens that its roughly
+9-10% systems advantage still improves compile-inclusive time-to-target. Do not
+launch a proxy until that claim and its stopping criteria are separately
+pre-registered and explicitly approved.
+
+**Artifacts.** Local profiler copies are under `profiles/exp007-gate/`; remote
+timing and profiler runs used `runs/exp007-gate/`. Recorded monetary cost is not
+available in the supplied artifacts.
 
 **Branch and run identity.** Implementation belongs on `exp007/mlp-3d`; future
 run names, W&B group, and result directories use `exp007`. Do not combine GQA,
