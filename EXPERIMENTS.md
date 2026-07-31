@@ -42,6 +42,44 @@ comparison, use 3.59777. A seed-0 result worse by more than 0.004 is normally a
 kill; better by more than 0.004 earns seeds 1 and 2; the grey zone is judged by
 the pre-registered mechanism.
 
+### Frozen baseline components
+
+The reference model is `d12`: vocabulary 50,257, 12 transformer blocks, 12
+attention heads, and embedding width 768. Each block is pre-norm residual:
+RMSNorm (epsilon `1e-6`) -> causal self-attention -> scaled residual, then
+RMSNorm -> GELU MLP (`D -> 4D -> D`) -> residual. The attention projections are
+QKV and output linear layers without bias. Attention uses PyTorch SDPA with
+`is_causal=True`; on the measured CUDA stack the profiler reports its
+FlashAttention forward/backward kernels.
+
+Position information comes from RoPE on Q and K, not learned positional
+embeddings. The token embedding and bias-free `lm_head` share one weight matrix.
+There are no linear biases, dropout, LayerNorm affine parameters, or learned
+position embeddings. Therefore it is GPT-2-sized (the d12 124M-scale shape),
+but not a literal GPT-2 implementation.
+
+The optimizer is one AdamW over `self.parameters()` -- no separate decay/no-decay
+parameter groups. The full baseline launch uses peak LR `0.0018`, weight decay
+`0.1`, and betas `(0.9, 0.95)`. Its fixed training layout is micro-batch
+`B=16`, sequence length `T=1024`, accumulation 32, or 524,288 target tokens per
+optimizer update.
+
+### RTX 4090 capability and measured operating point
+
+The rented card class is GeForce RTX 4090 (Ada, CUDA capability 8.9) with 24 GB
+GDDR6X VRAM. Ada Tensor Cores support BF16, TF32 and FP8 operations; see NVIDIA's
+[Ada tuning guide](https://docs.nvidia.com/cuda/archive/13.0.3/ada-tuning-guide/index.html)
+and [RTX precision support matrix](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/getting-started/support-matrix-1/1.2.html).
+Capability is not the baseline configuration: this study uses BF16 autocast;
+TF32 and FP8 are not enabled or validated training configurations.
+
+What is measured for the reference run is 9,825 MiB peak allocated memory at
+`B=16, T=1024, accum=32`. This leaves apparent VRAM headroom, but it does **not**
+establish a maximum feasible micro-batch: that limit has not been measured on the
+frozen stack and must not be inferred from `24 GB - 9,825 MiB`. The baseline
+uses PyTorch SDPA; FlashAttention is a selected measured kernel path, not a
+hardware feature implied merely by the word "Ada".
+
 ## Baseline profiler context
 
 **Measurement:** 24 July 2026, RTX 4090, after warm-up: 4.030 s for a complete

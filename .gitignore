@@ -10,10 +10,8 @@ nocap-runs-backup/
 notes.md
 AGENTS.md
 DECISIONS.md
-IDEAS.md
+IDEAS_AND_BACKLOG.md
 QUESTIONS.md
-RESEARCH_BACKLOG.md
-LEARNING_BACKLOG.md
 REMOTE_COMMANDS.md
 profiles/**/rank*_trace.json
 .venv*/
