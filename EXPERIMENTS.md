@@ -105,7 +105,7 @@ proposal's cost but does not predict a loss improvement.
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | proxy seed 0 approved | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Run proxy seed 0; promote only if the pre-registered quality gate passes |
-| exp008 | systems benchmark rerun required | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First 50-update attempt is invalid: recorded clean SHA `bc8ebb5` belongs to exp007, not GQA | Rerun the systems benchmark from exact clean SHA `a40345e`; no proxy before a valid systems pass |
+| exp008 | systems benchmark rerun required | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First 50-update attempt is invalid: recorded clean SHA `bc8ebb5` belongs to exp007, not GQA | Rerun the systems benchmark from exact clean SHA `3da417e`; no proxy before a valid systems pass |
 
 ## Completed experiments
 
@@ -804,7 +804,7 @@ attention path without materialized K/V repeats or hidden copy overhead.
 **Systems benchmark and falsifier.** Run fresh baseline and GQA processes on
 one sustained-clock RTX 4090 at the exact baseline shapes. For exp008, first
 verify a clean checkout of full SHA
-`a40345e42b2dbfe29e9044a29568bb127397b5e6`. Use 50 updates, measure initial
+`3da417ee1ff9e2f965584adab84ae4ea23e3f3a9`. Use 50 updates, measure initial
 compile/warm-up separately, and compare the median of complete optimizer updates
 11-48 with the same-host baseline. Profile a post-warm-up full update and record
 tokens/s, `aten::mm`, FlashAttention forward/backward, any repeat/copy kernels,
@@ -839,8 +839,9 @@ A separate forced fused-SDPA GQA smoke test passed, which is limited evidence
 that the tensor shapes and backend call are compatible. It is not a compiled
 full-model timing result and does not satisfy the systems gate.
 
-**Branch and run identity.** Implementation commit `a40345e` is on
-`exp008/gqa-4kv` and was pushed to origin. The invalid downloaded artifacts are
-retained locally under `profiles/exp008-gate/exp008/` for provenance. The next
-benchmark must make the recorded full SHA, not the directory name, the first
-acceptance check.
+**Branch and run identity.** The reviewed GQA implementation is commit
+`a40345e`; runnable branch head `3da417e` adds only the dedicated safe benchmark
+launcher. Both are on `exp008/gqa-4kv` and pushed to origin. The invalid
+downloaded artifacts are retained locally under `profiles/exp008-gate/exp008/`
+for provenance. The next benchmark must make the recorded full branch-head SHA,
+not the directory name, the first acceptance check.
