@@ -105,7 +105,7 @@ proposal's cost but does not predict a loss improvement.
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | proxy seed 0 approved | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Run proxy seed 0; promote only if the pre-registered quality gate passes |
-| exp008 | proxy seed 0 explicitly approved | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First systems attempt was invalid because it ran exp007; fused GQA smoke passed | Run one GQA proxy from clean SHA `ed6e71b`; do not claim a speedup without a valid same-host MHA comparison |
+| exp008 | proxy seed 0 explicitly approved | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First systems attempt was invalid because it ran exp007; fused GQA smoke passed | Run one GQA proxy from clean SHA `2a5cf20`; do not claim a speedup without a valid same-host MHA comparison |
 
 ## Completed experiments
 
@@ -860,8 +860,9 @@ full-model timing result and does not satisfy the systems gate.
 
 **Branch and run identity.** The reviewed GQA implementation is commit
 `a40345e`; runnable branch head
-`ed6e71b31ba1a83dfdd782bc1c3176d3c84d920e` adds dedicated benchmark and
-one-shot proxy launchers. All are on `exp008/gqa-4kv` and pushed to origin. The
+`2a5cf204f538bf0592f94defaca983c9f162876e` adds dedicated benchmark and
+one-shot proxy launchers without a pre-run lifecycle mutation. All are on
+`exp008/gqa-4kv` and pushed to origin. The
 invalid downloaded artifacts are retained locally under
 `profiles/exp008-gate/exp008/` for provenance. The proxy must record the full
 branch-head SHA, not merely an exp008 directory name.
