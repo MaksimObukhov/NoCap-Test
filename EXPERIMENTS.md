@@ -105,7 +105,7 @@ proposal's cost but does not predict a loss improvement.
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | proxy seed 0 approved | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Run proxy seed 0; promote only if the pre-registered quality gate passes |
-| exp008 | systems benchmark rerun required | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First 50-update attempt is invalid: recorded clean SHA `bc8ebb5` belongs to exp007, not GQA | Rerun the systems benchmark from exact clean SHA `3da417e`; no proxy before a valid systems pass |
+| exp008 | proxy seed 0 explicitly approved | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First systems attempt was invalid because it ran exp007; fused GQA smoke passed | Run one GQA proxy from clean SHA `ed6e71b`; do not claim a speedup without a valid same-host MHA comparison |
 
 ## Completed experiments
 
@@ -771,9 +771,9 @@ causal test.
 
 ### exp008 — grouped-query attention (12 query heads, 4 KV heads)
 
-**Status:** implementation complete; systems benchmark must be rerun. The first
-attempt on 31 July 2026 did not execute the exp008 commit and is invalid as GQA
-evidence. No proxy or paid training approved.
+**Status:** proxy seed 0 explicitly approved on 31 July 2026 despite the missing
+valid systems comparison. The first systems attempt did not execute the exp008
+commit and remains invalid as GQA evidence.
 
 **Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
 accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
@@ -821,9 +821,28 @@ health.
   K/V replication large enough to erase the projection saving.
 - Wrong SHA, dirty source, eager fallback, a recompile storm, incorrect tensor
   or parameter shapes, OOM, NaN, or unhealthy early loss invalidates the run.
-- A systems pass promotes exp008 only to a proxy candidate. Its quality and
-  compile-inclusive time-to-target hypothesis must be pre-registered separately
-  before any paid proxy.
+- A systems pass would normally be required before proxy promotion. The
+  explicitly authorised exception below does not repair the missing speed
+  evidence or permit a time-to-target win to be claimed from this run alone.
+
+**Proxy seed-0 hypothesis and decision rule.** With the baseline proxy token
+budget of 937,426,944 targets, unchanged data order, optimizer, LR schedule,
+effective batch, validation, and seed 0, 12Q/4KV GQA will retain enough learning
+efficiency to remain competitive with the baseline seed-0 final validation loss
+of 3.597773. The explicitly approved run bypasses the unresolved systems gate;
+it measures quality and produces GQA timing, but cannot by itself establish a
+same-host speedup against MHA.
+
+- Final validation loss `<= 3.593773` passes the seed-0 quality gate and permits
+  consideration of seeds 1/2 after the missing systems comparison is resolved.
+- Final validation loss `>= 3.601773` kills the quality hypothesis and stops
+  exp008 without more seeds.
+- The interval `(3.593773, 3.601773)` is inconclusive and does not automatically
+  earn more compute.
+- Wrong SHA, dirty tracked source, token/order/LR mismatch, OOM, NaN, missing
+  durable artifacts, or failed W&B completion invalidates the proxy.
+- Compile-inclusive time-to-target remains unproven unless GQA is also compared
+  with MHA on the same calibrated host.
 
 **Invalid first benchmark attempt.** The directory named
 `runs/exp008-gqa-4kv-profile-20260731T123134Z` reported a 3,607.49 ms median for
@@ -840,8 +859,9 @@ that the tensor shapes and backend call are compatible. It is not a compiled
 full-model timing result and does not satisfy the systems gate.
 
 **Branch and run identity.** The reviewed GQA implementation is commit
-`a40345e`; runnable branch head `3da417e` adds only the dedicated safe benchmark
-launcher. Both are on `exp008/gqa-4kv` and pushed to origin. The invalid
-downloaded artifacts are retained locally under `profiles/exp008-gate/exp008/`
-for provenance. The next benchmark must make the recorded full branch-head SHA,
-not the directory name, the first acceptance check.
+`a40345e`; runnable branch head
+`ed6e71b31ba1a83dfdd782bc1c3176d3c84d920e` adds dedicated benchmark and
+one-shot proxy launchers. All are on `exp008/gqa-4kv` and pushed to origin. The
+invalid downloaded artifacts are retained locally under
+`profiles/exp008-gate/exp008/` for provenance. The proxy must record the full
+branch-head SHA, not merely an exp008 directory name.
