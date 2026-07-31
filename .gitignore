@@ -13,6 +13,7 @@ DECISIONS.md
 IDEAS_AND_BACKLOG.md
 QUESTIONS.md
 REMOTE_COMMANDS.md
+research-reset-beliefs.md
 profiles/**/rank*_trace.json
 .venv*/
 __pycache__/
