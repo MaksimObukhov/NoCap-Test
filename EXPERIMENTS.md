@@ -104,6 +104,7 @@ proposal's cost but does not predict a loss improvement.
 | exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
+| exp007 | planned systems benchmark | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | Pending exact-shape RTX 4090 benchmark | Require at least 3% faster full training updates before defining a proxy |
 
 ## Completed experiments
 
@@ -640,3 +641,57 @@ systems verdict.
 **Artifacts.** Local uploaded bundle:
 `nocap-runs-backup/exp006-proxy-20260730/proxy-seed-0/`. W&B:
 <https://wandb.ai/m-obukhov-home/nocap-baseline/runs/k8v23t2i>.
+
+### exp007 — narrower MLP (4D -> 3D)
+
+**Status:** planned systems benchmark; no proxy or paid training approved.
+
+**Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
+accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
+other architectural components held fixed, reducing the MLP expansion ratio
+from 4D to 3D will reduce the median steady-state time of a complete training
+update by at least 3% relative to the fixed 4D baseline.
+
+**Causal mechanism and headroom.** Each transformer block contains two MLP
+linear projections, `D -> 4D` and `4D -> D`. For `D=768`, exp007 changes the
+intermediate width from 3,072 to 2,304, so both projections perform 25% less
+forward arithmetic; their input- and weight-gradient matrix multiplications
+shrink correspondingly. Across 12 blocks this removes 14,155,776 parameters.
+The existing profile attributes 67.07% of CUDA time to `aten::mm`, but does not
+identify all matrix shapes. A FLOP-weighted Amdahl estimate gives an optimistic
+full-update speedup ceiling of about 8.3%; this is a sizing estimate, not a
+prediction.
+
+**Controlled change.** Only the two MLP projection dimensions change. Attention,
+GELU, residual scaling, RMSNorm, tied embeddings and `lm_head`, initialization
+policy, optimizer settings, effective batch, token order, validation, seed,
+compilation policy, and software stack remain unchanged. The variant starts
+from a fresh initialization because a 4D checkpoint is shape-incompatible.
+
+**Systems benchmark.** Compare fresh 4D and 3D processes on one sustained-clock
+RTX 4090 at the exact baseline shapes. Measure compile latency separately, then
+compare post-warm-up complete training updates, each comprising 32
+forward/backward microsteps plus `optimizer.step()`. Record median update time,
+tokens/s, `aten::mm`, peak allocated memory, compilation/recompilation evidence,
+and the presence of the expected CUDA kernels. Verify the parameter-count delta
+before interpreting timing.
+
+**Success and stopping criteria.**
+
+- Median steady-state full-update time must improve by at least 3% against the
+  same-host 4D control.
+- Extra compile cost must not erase the projected saving at proxy or full-run
+  scale.
+- Eager fallback, a recompile storm, incorrect parameter shapes/counts, OOM, or
+  NaN invalidates the benchmark.
+- Finite, same-order-of-magnitude loss and gradients on the first identical
+  batches are a health gate. Failure kills the architecture candidate, but does
+  not by itself falsify the narrower-GEMM timing mechanism.
+- A passing benchmark promotes exp007 only to a proxy candidate. Before paid
+  proxy seed 0, separately pre-register the loss/non-inferiority and
+  compile-inclusive time-to-target criteria.
+
+**Branch and run identity.** Implementation belongs on `exp007/mlp-3d`; future
+run names, W&B group, and result directories use `exp007`. Do not combine GQA,
+activation changes, LR changes, or compensating width changes in this first
+causal test.
