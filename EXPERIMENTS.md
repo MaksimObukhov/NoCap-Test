@@ -105,6 +105,7 @@ proposal's cost but does not predict a loss improvement.
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | completed systems benchmark | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Systems gate passed; proxy remains unapproved pending a separate quality hypothesis |
+| exp008 | systems benchmark rerun required | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First 50-update attempt is invalid: recorded clean SHA `bc8ebb5` belongs to exp007, not GQA | Rerun the systems benchmark from exact clean SHA `a40345e`; no proxy before a valid systems pass |
 
 ## Completed experiments
 
@@ -731,3 +732,79 @@ available in the supplied artifacts.
 run names, W&B group, and result directories use `exp007`. Do not combine GQA,
 activation changes, LR changes, or compensating width changes in this first
 causal test.
+
+### exp008 — grouped-query attention (12 query heads, 4 KV heads)
+
+**Status:** implementation complete; systems benchmark must be rerun. The first
+attempt on 31 July 2026 did not execute the exp008 commit and is invalid as GQA
+evidence. No proxy or paid training approved.
+
+**Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
+accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
+other architectural components held fixed, replacing 12-head multi-head
+attention with 12 query heads and 4 shared key/value heads will reduce the
+median steady-state time of a complete training update by at least 3% relative
+to the fixed 12-KV-head baseline.
+
+**Causal mechanism and measured headroom.** GQA groups three query heads around
+each key/value head. Query width remains 768, while key and value widths each
+fall from 768 to 256. The combined QKV projection therefore narrows from 2,304
+to 1,280 outputs, a 44.4% reduction in that projection's forward arithmetic and
+corresponding backward matrix multiplications. Across 12 blocks this removes
+9,437,184 parameters. It does not shrink the attention output projection,
+`lm_head`, MLPs, or the number of query-by-key attention scores. The baseline
+profile places only about 8.9% of CUDA time in FlashAttention and does not
+isolate QKV projection GEMMs, so the 3% full-update gain remains an empirical
+gate rather than a FLOP-derived expectation.
+
+**Controlled change.** Only the number of key/value heads and the resulting QKV
+projection width change. Model width, 12 query heads, head dimension, attention
+output shape, MLP, normalization, embeddings and `lm_head`, initialization
+policy, effective batch, token order, validation, seed, optimizer, LR schedule,
+and compilation policy remain unchanged. PyTorch SDPA receives
+`enable_gqa=True`; the benchmark must verify that it retains the fused CUDA
+attention path without materialized K/V repeats or hidden copy overhead.
+
+**Systems benchmark and falsifier.** Run fresh baseline and GQA processes on
+one sustained-clock RTX 4090 at the exact baseline shapes. For exp008, first
+verify a clean checkout of full SHA
+`a40345e42b2dbfe29e9044a29568bb127397b5e6`. Use 50 updates, measure initial
+compile/warm-up separately, and compare the median of complete optimizer updates
+11-48 with the same-host baseline. Profile a post-warm-up full update and record
+tokens/s, `aten::mm`, FlashAttention forward/backward, any repeat/copy kernels,
+peak allocated memory, compilation/recompilation evidence, and early loss
+health.
+
+**Success and stopping criteria.**
+
+- Median steady-state full-update time must improve by at least 3% against the
+  same-host MHA control.
+- Extra compilation cost must not erase the projected saving at proxy or
+  full-run scale.
+- The expected fused attention backend must remain active without materialized
+  K/V replication large enough to erase the projection saving.
+- Wrong SHA, dirty source, eager fallback, a recompile storm, incorrect tensor
+  or parameter shapes, OOM, NaN, or unhealthy early loss invalidates the run.
+- A systems pass promotes exp008 only to a proxy candidate. Its quality and
+  compile-inclusive time-to-target hypothesis must be pre-registered separately
+  before any paid proxy.
+
+**Invalid first benchmark attempt.** The directory named
+`runs/exp008-gqa-4kv-profile-20260731T123134Z` reported a 3,607.49 ms median for
+updates 11-48, a 176,651.75 ms first update, 9,448 MiB peak memory, 2.372 s of
+`aten::mm`, and fused FlashAttention kernels. However, its canonical
+`summary.json` records clean commit
+`bc8ebb536e9af8813a1ba003170936e6bd79b058`, which is the exp007 3D-MLP
+implementation. The run is therefore a repeat measurement of exp007 despite
+its directory name. None of these timing, memory, profiler, or loss values are
+evidence about GQA and they must not be used to promote exp008.
+
+A separate forced fused-SDPA GQA smoke test passed, which is limited evidence
+that the tensor shapes and backend call are compatible. It is not a compiled
+full-model timing result and does not satisfy the systems gate.
+
+**Branch and run identity.** Implementation commit `a40345e` is on
+`exp008/gqa-4kv` and was pushed to origin. The invalid downloaded artifacts are
+retained locally under `profiles/exp008-gate/exp008/` for provenance. The next
+benchmark must make the recorded full SHA, not the directory name, the first
+acceptance check.
