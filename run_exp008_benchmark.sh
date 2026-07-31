@@ -58,11 +58,6 @@ if not wandb.login(key=os.environ["WANDB_API_KEY"], verify=True):
 print("W&B authentication verified")
 PY
 
-# Vast documents start on an already-running instance as a safe lifecycle
-# authentication check. Auto-stop is still not armed if this command fails.
-vastai start instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" >/dev/null
-echo "Vast lifecycle authentication verified"
-
 export WANDB_ENABLED=1
 export WANDB_MODE=online
 export WANDB_PROJECT="${WANDB_PROJECT:-nocap-baseline}"
