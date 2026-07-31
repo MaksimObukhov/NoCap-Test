@@ -104,7 +104,7 @@ proposal's cost but does not predict a loss improvement.
 | exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
-| exp007 | completed systems benchmark | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Systems gate passed; proxy remains unapproved pending a separate quality hypothesis |
+| exp007 | proxy seed 0 approved | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Run proxy seed 0; promote only if the pre-registered quality gate passes |
 | exp008 | systems benchmark rerun required | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First 50-update attempt is invalid: recorded clean SHA `bc8ebb5` belongs to exp007, not GQA | Rerun the systems benchmark from exact clean SHA `a40345e`; no proxy before a valid systems pass |
 
 ## Completed experiments
@@ -645,8 +645,9 @@ systems verdict.
 
 ### exp007 — narrower MLP (4D -> 3D)
 
-**Status:** systems benchmark completed on 31 July 2026; passed. No proxy or
-paid training approved.
+**Status:** systems benchmark completed on 31 July 2026 and passed. Proxy seed
+0 was separately pre-registered and approved for launch on 31 July 2026; seeds
+1/2 and a full run remain unapproved.
 
 **Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
 accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
@@ -723,6 +724,41 @@ whether the smaller MLP needs few enough additional tokens that its roughly
 9-10% systems advantage still improves compile-inclusive time-to-target. Do not
 launch a proxy until that claim and its stopping criteria are separately
 pre-registered and explicitly approved.
+
+**Proxy seed-0 hypothesis.** At the same 937,426,944 target tokens and 1,788
+updates as baseline proxy seed 0, with seed, FineWeb token order, effective
+batch, sequence length, optimizer, LR schedule, validation, BF16, compilation
+policy, and all non-MLP architecture held fixed, the 3D MLP will finish with
+validation loss no more than 0.018 above baseline seed 0 (`3.597773`). Combined
+with the measured compile-inclusive systems saving, that is strong enough to
+retain the hypothesis that 3D improves expected time-to-target.
+
+The tolerance is an economic gate, not a claim of equal quality per token. The
+measured 10.54% steady speedup allows approximately 10% more training time at a
+fixed token budget. As a rough translation only, the baseline proxy-to-full
+slope of about 0.1555 loss per token doubling maps that margin to roughly 0.022
+loss. Because that estimate comes from only two terminal budgets, the pass
+boundary keeps about 0.004 loss of protection rather than using 0.022 directly.
+
+**Proxy controls and decision rule.** Run only seed 0 from the clean pushed
+`exp007/mlp-3d` SHA. The primary metric is final validation loss at exactly
+937,426,944 target tokens; wall time, tokens/s, peak VRAM, compile behaviour,
+loss trajectory, gradients, checkpoint integrity, and W&B/run identity are
+secondary health and provenance checks.
+
+- Pass: final validation loss <= `3.615773` (delta <= `+0.018000`). This earns
+  proxy seeds 1/2, not a full run.
+- Grey zone: `3.615773 < loss < 3.623773`. Stop and reassess the trajectory and
+  time-to-target model; do not promote automatically.
+- Kill: final validation loss >= `3.623773` (delta >= `+0.026000`). Do not run
+  seeds 1/2 unchanged.
+- Wrong SHA, changed token budget/order, changed schedule or validation,
+  fallback/recompile pathology, corrupt or missing checkpoint/summary, OOM,
+  NaN/Inf, or clearly unhealthy loss/gradients invalidates the run.
+
+Passing this proxy does not establish late-target benefit: reduced capacity can
+hurt more near the full target. Seeds 1/2 are required before deciding whether
+the remaining transfer risk deserves a full run.
 
 **Artifacts.** Local profiler copies are under `profiles/exp007-gate/`; remote
 timing and profiler runs used `runs/exp007-gate/`. Recorded monetary cost is not
