@@ -104,8 +104,8 @@ proposal's cost but does not predict a loss improvement.
 | exp004-B | completed proxy s0, negative | Same proxy tokens exactly once; move all score >=3 tokens into a warmdown-aligned enriched mixture | 3.612175, delta +0.014402; accounting passed | Kill the hypothesis; do not run seeds 1/2 |
 | exp005 | stopped at systems gate | T=512 for updates 0-895, then T=1024; keep tokens/update, token order, LR, and validation fixed | T=512 was 2.59% faster steady-state, but compile overhead projected -1.21% net proxy speedup | Systems hypothesis failed; no exp005 proxy |
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
-| exp007 | proxy seed 0 approved | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 10.54% faster steady update; projected net proxy saving 665.27 s; profiler mechanism confirmed | Run proxy seed 0; promote only if the pre-registered quality gate passes |
-| exp008 | proxy seed 0 explicitly approved | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | First systems attempt was invalid because it ran exp007; fused GQA smoke passed | Run one GQA proxy from clean SHA `2a5cf20`; do not claim a speedup without a valid same-host MHA comparison |
+| exp007 | completed proxy s0, grey | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 3.616361, delta +0.018588 vs baseline s0: inside the pre-registered grey zone; valid systems gain remains 10.54% | Do not promote automatically; seeds 1/2 and full remain unapproved pending reassessment of quality and time-to-target |
+| exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
 
 ## Completed experiments
 
@@ -646,8 +646,8 @@ systems verdict.
 ### exp007 — narrower MLP (4D -> 3D)
 
 **Status:** systems benchmark completed on 31 July 2026 and passed. Proxy seed
-0 was separately pre-registered and approved for launch on 31 July 2026; seeds
-1/2 and a full run remain unapproved.
+0 completed from the clean branch head on 31 July 2026, but fell in the
+pre-registered grey zone. Seeds 1/2 and a full run remain unapproved.
 
 **Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
 accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
@@ -760,6 +760,36 @@ Passing this proxy does not establish late-target benefit: reduced capacity can
 hurt more near the full target. Seeds 1/2 are required before deciding whether
 the remaining transfer risk deserves a full run.
 
+**Proxy seed-0 result (31 July 2026).** The clean branch-head SHA
+`e7c3e9228107f14559bec6c079c83be489b221a7` ran seed 0 for the exact
+937,426,944 target tokens and 1,788 updates. The local summary, W&B summary,
+and stdout agree on completion and the following values:
+
+| Metric | Result |
+|---|---:|
+| Final validation loss | 3.616361 |
+| Delta vs baseline seed 0 (3.597773) | **+0.018588** |
+| Delta vs baseline three-seed mean (3.599351) | **+0.017011** |
+| Training time | 6,552.268 s |
+| Compile-inclusive wall time | 6,750.093 s |
+| Reported throughput | 143,069 tok/s |
+| Peak allocated memory | 9,027 MiB |
+| `git_dirty` / status | `false` / `complete` |
+
+The final loss is 0.000588 above the PASS boundary (3.615773) and 0.007412
+below the KILL boundary (3.623773), therefore this is a **grey-zone result**.
+It does not earn proxy seeds 1/2 or a full run automatically. Against baseline
+seed 0, validation was lower through step 640, approximately tied at step 768,
+and higher from step 896 through the final validation; this is no evidence that
+the early advantage persists near the challenge target.
+
+The archived baseline proxy timing is from another rented host. Consequently,
+the proxy's training time, wall time, and reported throughput above are
+provenance observations only, not a measured exp007 speedup. The valid
+same-host systems benchmark and profiler remain the evidence for the 10.54%
+steady-update improvement. No monetary cost or durable W&B URL/export was
+captured in the local backup.
+
 **Artifacts.** Local profiler copies are under `profiles/exp007-gate/`; remote
 timing and profiler runs used `runs/exp007-gate/`. Recorded monetary cost is not
 available in the supplied artifacts.
@@ -771,9 +801,10 @@ causal test.
 
 ### exp008 — grouped-query attention (12 query heads, 4 KV heads)
 
-**Status:** proxy seed 0 explicitly approved on 31 July 2026 despite the missing
-valid systems comparison. The first systems attempt did not execute the exp008
-commit and remains invalid as GQA evidence.
+**Status:** proxy seed 0 completed on 31 July 2026 despite the missing valid
+systems comparison. Its pre-registered quality gate was killed. The first
+systems attempt did not execute the exp008 commit and remains invalid as GQA
+evidence.
 
 **Hypothesis.** On the same calibrated RTX 4090, with `B=16`, `T=1024`,
 accumulation 32, data, optimizer, LR schedule, BF16, `torch.compile`, and all
@@ -843,6 +874,35 @@ same-host speedup against MHA.
   durable artifacts, or failed W&B completion invalidates the proxy.
 - Compile-inclusive time-to-target remains unproven unless GQA is also compared
   with MHA on the same calibrated host.
+
+**Proxy seed-0 result (31 July 2026).** The clean branch-head SHA
+`2a5cf204f538bf0592f94defaca983c9f162876e` ran seed 0 for the exact
+937,426,944 target tokens and 1,788 updates. The local summary, W&B summary,
+and stdout agree on completion and the following values:
+
+| Metric | Result |
+|---|---:|
+| Final validation loss | 3.617567 |
+| Delta vs baseline seed 0 (3.597773) | **+0.019794** |
+| Delta vs baseline three-seed mean (3.599351) | **+0.018216** |
+| Training time | 6,866.870 s |
+| Compile-inclusive wall time | 7,185.187 s |
+| Reported throughput | 136,514 tok/s |
+| Peak allocated memory | 9,124 MiB |
+| `git_dirty` / status | `false` / `complete` |
+
+The final loss is 0.015794 above the KILL boundary (3.601773). The quality
+hypothesis is therefore **killed**: do not run exp008 seeds 1/2 unchanged.
+After the early step-0 difference, every matched validation from step 128
+through the final validation is worse than baseline seed 0, so the trajectory
+provides no late-quality rescue.
+
+The archived baseline proxy and exp008 proxy ran on different rented hosts.
+Their timings and throughputs are not a causal MHA-versus-GQA comparison and
+must not be reported as a speedup. A valid same-host MHA control, a full-model
+GQA profiler, and isolated total compile time are still missing. The local
+backup also lacks the proxy `config.json`, `metrics.jsonl`, checkpoint, and a
+durable W&B URL/export; no monetary cost was recorded.
 
 **Invalid first benchmark attempt.** The directory named
 `runs/exp008-gqa-4kv-profile-20260731T123134Z` reported a 3,607.49 ms median for
