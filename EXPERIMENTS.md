@@ -106,7 +106,7 @@ proposal's cost but does not predict a loss improvement.
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | completed proxy s0, grey | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 3.616361, delta +0.018588 vs baseline s0: inside the pre-registered grey zone; valid systems gain remains 10.54% | Do not promote automatically; seeds 1/2 and full remain unapproved pending reassessment of quality and time-to-target |
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
-| exp009 | planned offline measurement | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | Not run | Run only the frozen-checkpoint falsifier below; no training is authorised |
+| exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
 | exp010 | planned offline measurement | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Not run | Run only frozen-weight moment replay; no capped optimizer or training is authorised |
 
 ## Completed experiments
@@ -970,6 +970,32 @@ Primary artifacts are the full branch SHA, checkpoint identities and arguments,
 per-batch/per-layer measurements, aggregate decision, elapsed time, GPU/runtime
 metadata, and stdout. Any later trainable RCA experiment requires a new
 pre-registration and a separate paid-compute approval.
+
+**Offline result (1 August 2026).** Clean branch SHA
+`44eba56557e772d7221f0592326a8b7ce82854a5` evaluated the canonical exp000
+proxy checkpoint at step 1,788 and full checkpoint at step 4,768 on one RTX
+4090 with PyTorch 2.11/CUDA 12.8. Both checkpoints retained exact parameter
+equality. The complete measurement took 42.60 seconds and returned **KILL**:
+neither checkpoint had a passing layer, so there was no shared passing layer.
+
+The result is more specific than “no signal.” Later layers often had positive
+alignment excess and negative mean autograd gate gradients. For example, layer
+7 passed the alignment, gradient-significance, and negative-fraction checks at
+both checkpoints; its mean finite-difference slope was also negative at both.
+However, no layer's four-batch centred finite-difference slope was below zero
+by two standard errors. That pre-registered confirmatory check failed for every
+layer and therefore controls the verdict. The estimated local effects were also
+small: layer-7 mean gate gradients were about `-4.15e-4` at proxy and `-6.00e-4`
+at full.
+
+This is a valid formal kill, not proof that residual-aligned components never
+matter. It says the unchanged RCA proposal did not produce a sufficiently
+large, independently confirmed local loss benefit to justify implementation or
+paid training. Do not increase the finite-difference sample after seeing this
+result and retroactively relabel exp009 as passing.
+
+Artifacts are retained under
+`profiles/exp009-gate/exp009-rca-gate-20260801T125454Z/` and remain untracked.
 
 ## exp010 — Selective Spectral AdamW offline gate
 
