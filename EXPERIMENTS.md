@@ -112,6 +112,7 @@ proposal's cost but does not predict a loss improvement.
 | exp012 | planned nightly funnel | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | Awaiting same-host benchmark, 256-update health diagnostic, and proxy seed 0 | No full run tonight; promote only after the pre-registered proxy gate |
 | exp013 | planned nightly funnel | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | Awaiting exact-shape benchmark, 256-update health diagnostic, and proxy seed 0 | Test systems and loss/token claims separately; no full run tonight |
 | exp014 | planned nightly funnel | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | Awaiting layer diagnostics, same-host benchmark, health gate, and proxy seed 0 | Compare against uniform 3D as the capacity-matched systems control |
+| exp015 | planned nightly funnel | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Awaiting accounting, exact-shape benchmark, 256-update health gate, and proxy seed 0 | Require quality recovery without losing the 3D systems advantage |
 
 ## Completed experiments
 
@@ -1293,3 +1294,26 @@ capacity- and average-FLOP control; exp000 remains the quality reference.
   the thresholds are reported as inconclusive, not promoted by narrative.
 - Non-finite/pathological health, wrong SHA, accounting mismatch, dirty tracked
   files, missing artifacts, or failed W&B upload invalidates the stage.
+
+## exp015 — 2D SwiGLU versus 3D GELU
+
+**Status:** planned. No full run is authorised by this row.
+
+**Hypothesis.** A SwiGLU MLP with hidden width 2D has three D-by-hidden matrix
+products, or `6D^2` leading parameters/FLOPs, matching a 3D GELU MLP's two
+matrix products. Its learned multiplicative gate may recover at least `0.004`
+of exp007's proxy loss while preserving the uniform-3D systems gain. This is
+why the comparison is **2D SwiGLU versus 3D GELU**, not 2D versus 2D.
+
+**Night funnel.** Verify exact model and per-layer parameter accounting, run a
+50-update same-host benchmark, then a separate 256-update no-clipping health
+diagnostic. Run proxy seed 0 only if the compiled path is valid and the median
+complete-step regression versus uniform 3D is no more than 2%.
+
+- Proxy loss `<= 3.612361` recovers the minimum detectable `0.004` from
+  exp007; `<= 3.601773` is the stronger baseline-competitive threshold.
+- Loss `>= 3.620361` or a valid systems regression above 2% kills the unchanged
+  candidate. Intermediate quality is inconclusive.
+- The activation/gating kernel must remain compiled; eager fallback, recompile
+  storms, non-finite/pathological health, accounting mismatch, wrong SHA,
+  missing artifacts, or failed W&B upload invalidates the stage.
