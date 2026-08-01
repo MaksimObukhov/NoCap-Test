@@ -50,6 +50,8 @@ export WANDB_ENABLED=1
 export WANDB_MODE=online
 export WANDB_PROJECT=${WANDB_PROJECT:-nocap-baseline}
 export WANDB_GROUP=exp011-attn-v-spectral-cap
+export TORCHINDUCTOR_CACHE_DIR="${run_root}/torchinductor-cache"
+export TORCH_LOGS=recompiles
 
 mkdir -p "$(dirname "$run_root")"
 
