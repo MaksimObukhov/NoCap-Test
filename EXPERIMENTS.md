@@ -111,6 +111,7 @@ proposal's cost but does not predict a loss improvement.
 | exp011 | stopped at A, treatment killed | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A reduced functional concentration but lost too much first-order descent and over-amplified weaker proxy modes | Do not run B or C unchanged; any partial/descent-budgeted cap is a new experiment |
 | exp012 | planned nightly funnel | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | Awaiting same-host benchmark, 256-update health diagnostic, and proxy seed 0 | No full run tonight; promote only after the pre-registered proxy gate |
 | exp013 | planned nightly funnel | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | Awaiting exact-shape benchmark, 256-update health diagnostic, and proxy seed 0 | Test systems and loss/token claims separately; no full run tonight |
+| exp014 | planned nightly funnel | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | Awaiting layer diagnostics, same-host benchmark, health gate, and proxy seed 0 | Compare against uniform 3D as the capacity-matched systems control |
 
 ## Completed experiments
 
@@ -1264,3 +1265,31 @@ baseline token order, batch, WSD, AdamW, and token budget.
   at least 2%; loss `>= 3.601773` kills the unchanged treatment.
 - The health gate and provenance/W&B invalidation rules are identical to
   exp012. The diagnostic timing is never used as systems evidence.
+
+## exp014 — depth-shaped 3D-average MLP
+
+**Status:** planned. No full run is authorised by this row.
+
+**Hypothesis.** Holding the mean expansion at 3D, allocating widths
+`2.5D / 3D / 3.5D` to layers `0–3 / 4–7 / 8–11` will retain nearly the full
+systems gain of uniform 3D while recovering at least `0.004` proxy loss through
+more capacity in later blocks, where the residual representation is more
+task-specific. The shallow-to-deep increase is a testable allocation prior,
+not an established transformer law; per-layer gradient and update ratios are
+recorded so the result can challenge that prior.
+
+**Night funnel.** Run exact parameter/FLOP accounting, a 50-update benchmark,
+and a 256-update no-clipping diagnostic with per-layer normalized gradient and
+update/weight ratios. If valid, run proxy seed 0. Uniform 3D is the principal
+capacity- and average-FLOP control; exp000 remains the quality reference.
+
+- The benchmark passes when complete-step throughput is within 2% of the
+  same-host uniform-3D control. A larger regression is a systems kill unless
+  shape transitions or host drift make the comparison invalid.
+- Proxy success requires loss at least `0.004` better than exp007's
+  `3.616361`, i.e. `<= 3.612361`; `<= 3.601773` is the stronger threshold for
+  remaining competitive with the 4D baseline grey zone.
+- Loss worse than exp007 by `0.004` or more kills the allocation. Values between
+  the thresholds are reported as inconclusive, not promoted by narrative.
+- Non-finite/pathological health, wrong SHA, accounting mismatch, dirty tracked
+  files, missing artifacts, or failed W&B upload invalidates the stage.
