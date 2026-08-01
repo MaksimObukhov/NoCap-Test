@@ -153,6 +153,10 @@ print(json.dumps(result))
 
 
 def preflight(manifest, prepared, data_root, results_root, checkpoint_paths, probe_wandb):
+    if manifest["auto_stop"] != "disabled":
+        raise InfrastructureFailure(
+            "auto_stop must remain disabled until the live Vast guide is reviewed"
+        )
     if not os.environ.get("TMUX"):
         raise InfrastructureFailure(
             "TMUX is empty; attach to the instance-provided tmux session instead of creating one"
@@ -298,7 +302,7 @@ def parse_training_metrics(path):
 
 
 def steady_token_rate(records):
-    selected = [record for record in records if 11 <= record["step"] <= 48]
+    selected = records[10:-2]
     if len(selected) < 20:
         raise InfrastructureFailure("not enough updates 11-48 for a stable benchmark")
     previous_tokens = 0
@@ -622,10 +626,13 @@ def external_stage(
     worktree,
     stage_dir,
     stage_name,
+    updates,
     command,
     cache_root,
 ):
-    payload = stage_manifest(manifest, experiment, stage_name, "offline", 8, worktree)
+    payload = stage_manifest(
+        manifest, experiment, stage_name, "offline", updates, worktree
+    )
     if not start_stage(stage_dir, payload):
         return read_json(stage_dir / "gate_decision.json")
     environment = os.environ.copy()
@@ -637,7 +644,10 @@ def external_stage(
     )
     run_logged(command, worktree, environment, stage_dir / "stdout.log")
     summary = read_json(stage_dir / "summary.json")
-    if summary.get("source", {}).get("commit") != experiment["sha"]:
+    if (
+        summary.get("source", {}).get("commit") != experiment["sha"]
+        or summary.get("source", {}).get("tracked_dirty")
+    ):
         raise InfrastructureFailure(f"external-stage provenance mismatch: {stage_dir}")
     decision = summary.get("decision")
     if decision not in {"pass", "kill", "inconclusive"}:
@@ -667,6 +677,7 @@ def run_exp016(
         worktree,
         a_dir,
         "exp016-a-causal-replay",
+        16,
         [
             sys.executable,
             "analyze_exp016_a.py",
@@ -692,6 +703,7 @@ def run_exp016(
         worktree,
         b_dir,
         "exp016-b-systems",
+        150,
         [
             sys.executable,
             "run_exp016_b.py",
@@ -719,7 +731,7 @@ def run_exp016(
     if health["decision"] != "pass":
         return {"experiment": "exp016", "decision": "kill", "a": a, "b": b, "health": health, "proxy": "skipped"}
     proxy_dir = root / "proxy-seed-0"
-    training_stage(
+    proxy_summary = training_stage(
         manifest,
         control_path,
         experiment,
@@ -732,12 +744,15 @@ def run_exp016(
         1788,
         ["--descent_budgeted_attn_v"],
     )
-    proxy = proxy_gate(
-        proxy_dir,
-        experiment["proxy"]["pass_loss"],
-        experiment["proxy"]["kill_loss"],
-    )
-    upload_stage(control_path, manifest, proxy_dir, "exp016-proxy-seed-0")
+    if "decision" not in proxy_summary:
+        proxy = proxy_gate(
+            proxy_dir,
+            experiment["proxy"]["pass_loss"],
+            experiment["proxy"]["kill_loss"],
+        )
+        upload_stage(control_path, manifest, proxy_dir, "exp016-proxy-seed-0")
+    else:
+        proxy = read_json(proxy_dir / "gate_decision.json")
     return {"experiment": "exp016", "decision": proxy["decision"], "a": a, "b": b, "health": health, "proxy": proxy}
 
 
@@ -860,10 +875,6 @@ def main():
         write_json(status_path, payload)
         os.sync()
         print(json.dumps(payload, indent=2, sort_keys=True))
-        if manifest["auto_stop"] == "success-only":
-            raise InfrastructureFailure(
-                "success-only lifecycle action is intentionally not armed until the live Vast guide is reviewed"
-            )
     except Exception as error:
         write_json(
             status_path,
