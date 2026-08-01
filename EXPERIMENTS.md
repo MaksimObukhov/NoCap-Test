@@ -113,6 +113,7 @@ proposal's cost but does not predict a loss improvement.
 | exp013 | planned nightly funnel | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | Awaiting exact-shape benchmark, 256-update health diagnostic, and proxy seed 0 | Test systems and loss/token claims separately; no full run tonight |
 | exp014 | planned nightly funnel | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | Awaiting layer diagnostics, same-host benchmark, health gate, and proxy seed 0 | Compare against uniform 3D as the capacity-matched systems control |
 | exp015 | planned nightly funnel | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Awaiting accounting, exact-shape benchmark, 256-update health gate, and proxy seed 0 | Require quality recovery without losing the 3D systems advantage |
+| exp016 | planned staged gate | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Awaiting canonical-checkpoint causal replay, correctness/systems gate, then conditional health/proxy | Original internally derived variant; disclose close SPECTRA prior art and do not claim novelty |
 
 ## Completed experiments
 
@@ -1317,3 +1318,44 @@ complete-step regression versus uniform 3D is no more than 2%.
 - The activation/gating kernel must remain compiled; eager fallback, recompile
   storms, non-finite/pathological health, accounting mismatch, wrong SHA,
   missing artifacts, or failed W&B upload invalidates the stage.
+
+## exp016 — Descent-Budgeted Multi-Directional AdamW
+
+**Status:** planned staged gate. A proxy is conditional on A and B passing; no
+full run is authorised by this row.
+
+**Treatment.** For each attention-V AdamW-preconditioned direction `P`, estimate
+the leading two singular triplets and define
+
+```text
+gap = max(sigma_1 - sigma_2, 0)
+Q(alpha) = P - alpha * gap * u_1 v_1^T,  0 <= alpha <= 1
+alpha* = max alpha such that <G,Q(alpha)> / <G,P> >= 0.99
+```
+
+Apply `Q(alpha*)` without Frobenius renormalisation; all weaker directions are
+retained. This directly addresses exp011's failure mode: it spends at most 1%
+of predicted first-order descent and never amplifies the remainder merely to
+restore update norm. The scientific claim is an internally derived
+descent-constrained spectral reweighting variant of AdamW. It is not claimed as
+proven novel; SPECTRA is close prior art and must be disclosed.
+
+**A — canonical-checkpoint causal replay.** Replay the same eight frozen-weight
+effective batches at exp000 proxy and full seed-0 checkpoints. A passes only if
+both checkpoints have median descent retention at least 0.99, median update-norm
+retention at least 0.98, median functional leading-energy reduction at least
+10%, and `alpha* > 0` for at least 25% of layer/update records. Missing or wrong
+checkpoint state, parameter movement, non-positive descent, failed synthetic
+self-test, or NaN/Inf invalidates A; a valid failure is a scientific kill.
+
+**B — correctness and systems.** Verify zero-gap identity, V-only correction,
+descent-budget enforcement, optimizer-state round-trip, and deterministic
+resume. On one host compare control-before, treatment, and control-after for 50
+exact-shape updates with isolated compile caches. Median treatment complete-step
+overhead and projected proxy overhead must both be at most 1%, with no eager
+fallback, hidden recompile, OOM, or non-V mismatch.
+
+**C — conditional training.** Only if A and B pass, run a separate 128-update
+no-clipping health diagnostic and then proxy seed 0. Loss `<= 3.593773` passes,
+loss `>= 3.601773` kills, and the interval is inconclusive. Any provenance,
+token/order, artifact, or W&B failure invalidates the stage and stops the suite.
