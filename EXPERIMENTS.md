@@ -107,6 +107,7 @@ proposal's cost but does not predict a loss improvement.
 | exp007 | completed proxy s0, grey | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 3.616361, delta +0.018588 vs baseline s0: inside the pre-registered grey zone; valid systems gain remains 10.54% | Do not promote automatically; seeds 1/2 and full remain unapproved pending reassessment of quality and time-to-target |
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
 | exp009 | planned offline measurement | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | Not run | Run only the frozen-checkpoint falsifier below; no training is authorised |
+| exp010 | planned offline measurement | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Not run | Run only frozen-weight moment replay; no capped optimizer or training is authorised |
 
 ## Completed experiments
 
@@ -969,3 +970,48 @@ Primary artifacts are the full branch SHA, checkpoint identities and arguments,
 per-batch/per-layer measurements, aggregate decision, elapsed time, GPU/runtime
 metadata, and stdout. Any later trainable RCA experiment requires a new
 pre-registration and a separate paid-compute approval.
+
+## exp010 — Selective Spectral AdamW offline gate
+
+**Status:** planned measurement only. No capped optimizer, proxy training, or
+promotion is authorised by this entry.
+
+**Hypothesis.** At the canonical exp000 proxy and full seed-0 checkpoints,
+AdamW's bias-corrected preconditioned update matrices for at least one repeated
+hidden-matrix family are dominated by a leading singular direction, and the
+weaker right-singular subspace persists across adjacent data updates. This is a
+prerequisite for selectively limiting only the dominant mode while retaining
+weaker directions; it is not evidence that spectral capping trains better.
+
+**One measured intervention.** Load the exact model and AdamW states, freeze
+parameter values, and replay eight consecutive baseline effective batches per
+checkpoint with learning rate and weight decay set to zero. Reconstruct the
+bias-corrected preconditioned AdamW matrix before each zero-LR optimizer step.
+Measure hidden attention and MLP matrices only; split the fused attention input
+projection into Q, K, and V, and exclude embeddings and the tied `lm_head`.
+Record spectral energy, cap-fraction proxy `(sigma1 - sigma2) / ||A||_F`, the
+same statistics after applying the update to sampled module inputs, and overlap
+of singular modes 2 through 8 between adjacent effective batches.
+
+**Success and stopping criteria.** Use the baseline `B=16`, `T=1024`, and 32
+micro-steps per effective update. Capture at most 2,048 module-input rows per
+effective update. Estimate eight singular modes with a deterministic block
+power method and retain exact Frobenius norms.
+
+- A matrix family passes one checkpoint when its median cap-fraction is at
+  least 0.05, its median functional leading-mode energy is at least 0.10, and
+  its median adjacent-update overlap for modes 2--8 is at least the larger of
+  0.05 and three times the dimensional random-subspace expectation.
+- The mechanism gate passes only if an identical matrix family passes at both
+  proxy and full checkpoints. A full-only pass is weak/inconclusive.
+- If no family passes at the full checkpoint, stop this optimizer idea
+  unchanged. Do not infer usefulness from singular values without the
+  functional and temporal checks.
+- Wrong checkpoint identity or baseline arguments, changed batch continuation,
+  parameter movement above numerical equality, NaN/Inf, missing optimizer
+  state, or a failed spectral self-test invalidates the measurement.
+
+Primary artifacts are the full branch SHA, checkpoint identities and arguments,
+per-update/per-matrix metrics, family aggregates and decision, elapsed time,
+GPU/runtime metadata, and stdout. Any capped-update implementation requires a
+new pre-registration and a separate paid-compute approval.
