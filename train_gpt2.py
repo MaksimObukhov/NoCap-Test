@@ -102,12 +102,13 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_width = 2 * config.n_embd
+        self.c_gate = nn.Linear(config.n_embd, hidden_width, bias=False)
+        self.c_value = nn.Linear(config.n_embd, hidden_width, bias=False)
+        self.c_proj = nn.Linear(hidden_width, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.gelu(x)
+        x = F.silu(self.c_gate(x)) * self.c_value(x)
         x = self.c_proj(x)
         return x
 
