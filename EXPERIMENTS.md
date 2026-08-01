@@ -110,6 +110,7 @@ proposal's cost but does not predict a loss improvement.
 | exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
 | exp011 | stopped at A, treatment killed | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A reduced functional concentration but lost too much first-order descent and over-amplified weaker proxy modes | Do not run B or C unchanged; any partial/descent-budgeted cap is a new experiment |
 | exp012 | planned nightly funnel | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | Awaiting same-host benchmark, 256-update health diagnostic, and proxy seed 0 | No full run tonight; promote only after the pre-registered proxy gate |
+| exp013 | planned nightly funnel | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | Awaiting exact-shape benchmark, 256-update health diagnostic, and proxy seed 0 | Test systems and loss/token claims separately; no full run tonight |
 
 ## Completed experiments
 
@@ -1238,3 +1239,28 @@ of optimizer updates.
   `10.54%` result is a prior, not evidence for this new SHA.
 - Wrong SHA, dirty tracked files, changed token prefix, missing artifacts or
   failed W&B artifact upload invalidates a stage and stops the nightly suite.
+
+## exp013 — squared ReLU activation
+
+**Status:** planned. No full run is authorised by this row.
+
+**Hypothesis.** Replacing only `GELU(x)` with `ReLU(x)^2` in every unchanged
+4D MLP will either improve loss per token through a sparse, high-amplitude
+nonlinearity or reduce activation-kernel time enough to improve proxy
+time-to-quality. The two claims are evaluated separately: the baseline
+profiler's roughly 5% GELU share is only an Amdahl ceiling, not a predicted
+speedup.
+
+**Night funnel.** Run a fresh same-host baseline calibration, then a 50-update
+exact-shape treatment benchmark. Unless it is invalid or more than 3% slower,
+run a separate 256-update no-clipping diagnostic and then proxy seed 0 with the
+baseline token order, batch, WSD, AdamW, and token budget.
+
+- Benchmark speed alone does not pass or kill the quality mechanism. A valid
+  slowdown above 3%, compile/eager failure, or non-finite values stops before
+  proxy unless the 256-update diagnostic shows a pre-registered quality signal.
+- Proxy loss `<= 3.593773` passes the quality gate. A loss within the baseline
+  grey zone may remain interesting only if the same-host complete-step gain is
+  at least 2%; loss `>= 3.601773` kills the unchanged treatment.
+- The health gate and provenance/W&B invalidation rules are identical to
+  exp012. The diagnostic timing is never used as systems evidence.
