@@ -107,7 +107,7 @@ proposal's cost but does not predict a loss improvement.
 | exp007 | completed proxy s0, grey | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 3.616361, delta +0.018588 vs baseline s0: inside the pre-registered grey zone; valid systems gain remains 10.54% | Do not promote automatically; seeds 1/2 and full remain unapproved pending reassessment of quality and time-to-target |
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
 | exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
-| exp010 | planned offline measurement | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Not run | Run only frozen-weight moment replay; no capped optimizer or training is authorised |
+| exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
 
 ## Completed experiments
 
@@ -1041,3 +1041,46 @@ Primary artifacts are the full branch SHA, checkpoint identities and arguments,
 per-update/per-matrix metrics, family aggregates and decision, elapsed time,
 GPU/runtime metadata, and stdout. Any capped-update implementation requires a
 new pre-registration and a separate paid-compute approval.
+
+**Offline result (1 August 2026).** Clean branch SHA
+`f08a754240a0f3618ee4f96754de60d718f23e29` replayed eight frozen-weight
+effective updates at each canonical exp000 checkpoint on the same RTX 4090 and
+runtime as exp009. The self-test passed, all optimizer states were present,
+checkpoint parameters remained exactly unchanged, and the complete measurement
+took 130.97 seconds. The pre-registered mechanism gate **passed** with four
+shared matrix families:
+
+| Family | Median cap fraction, proxy / full | Functional leading energy, proxy / full | Weak-subspace overlap, proxy / full |
+|---|---:|---:|---:|
+| Attention output | 0.0587 / 0.1206 | 0.2451 / 0.6230 | 0.7913 / 0.7520 |
+| Attention V | 0.2283 / 0.1009 | 0.8824 / 0.8001 | 0.7704 / 0.7423 |
+| MLP down | 0.1210 / 0.2619 | 0.5615 / 0.8408 | 0.6609 / 0.6246 |
+| MLP up | 0.1029 / 0.0832 | 0.7735 / 0.8157 | 0.7020 / 0.7042 |
+
+Attention Q passed proxy but missed the full cap-fraction threshold narrowly
+(`0.0495 < 0.05`); attention K failed that threshold at both checkpoints. Of
+the shared families, attention V combines the strongest proxy cap fraction,
+strong functional concentration at both checkpoints, stable weak modes, and
+the smallest candidate matrices. It is therefore the leading family for a
+subsequent isolated falsifier, not yet an approved optimizer treatment.
+
+**Interpretation limit.** The gate measured the leading spectrum of the AdamW
+update `A` and, separately, the leading spectrum of its sampled functional
+effect `X A^T`. It did not measure how much of `X A^T` is caused specifically
+by the rank-one component that the proposal would remove, nor whether that
+component has favourable or harmful alignment with the current loss gradient.
+Activation covariance can make `X A^T` concentrated even when the candidate
+rank-one cap is not the cause. Thus the pass establishes spectral dominance and
+temporal persistence, but not that capping improves descent, loss per token, or
+time-to-target.
+
+Before implementing a capped optimizer, a new offline falsifier should measure
+the functional contribution and first-order loss contribution of
+`(sigma_1 - sigma_2) u_1 v_1^T` itself, beginning with attention V. Any later
+implementation must then pass an exact-shape full-update systems gate with no
+more than roughly 1% compile-inclusive overhead. No proxy or training run is
+authorised by this result.
+
+Artifacts are retained under
+`profiles/exp010-gate/exp010-spectral-adamw-gate-20260801T125712Z/` and remain
+untracked.
