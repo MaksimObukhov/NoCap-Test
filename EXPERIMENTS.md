@@ -106,6 +106,7 @@ proposal's cost but does not predict a loss improvement.
 | exp006 | completed proxy s0 | T=512 for updates 0-383, then T=1024; same tokens/update, source order, LR, and T=1024 validation | 3.600870, delta +0.003097 vs baseline s0; inside the pre-registered grey zone | No positive loss-per-token evidence; do not run seeds 1/2 |
 | exp007 | completed proxy s0, grey | Reduce the MLP expansion ratio from 4D to 3D; keep the rest of training fixed | 3.616361, delta +0.018588 vs baseline s0: inside the pre-registered grey zone; valid systems gain remains 10.54% | Do not promote automatically; seeds 1/2 and full remain unapproved pending reassessment of quality and time-to-target |
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
+| exp009 | planned offline measurement | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | Not run | Run only the frozen-checkpoint falsifier below; no training is authorised |
 
 ## Completed experiments
 
@@ -926,3 +927,45 @@ one-shot proxy launchers without a pre-run lifecycle mutation. All are on
 invalid downloaded artifacts are retained locally under
 `profiles/exp008-gate/exp008/` for provenance. The proxy must record the full
 branch-head SHA, not merely an exp008 directory name.
+
+## exp009 — Residual-Complement Attention offline gate
+
+**Status:** planned measurement only. No optimizer update, proxy training, or
+promotion is authorised by this entry.
+
+**Hypothesis.** At the canonical exp000 proxy and full seed-0 checkpoints, the
+post-`c_proj` attention update contains a non-random component parallel to the
+block residual stream. Removing a small learned-sign amount of only that
+component will have a locally favourable loss derivative in at least one
+consistent transformer layer. This is a prerequisite for Residual-Complement
+Attention; it is not evidence that a trained gate improves time-to-target.
+
+**One measured intervention.** Freeze all model weights. For each attention
+block, decompose its output `a` against that block's pre-attention residual
+input `u` and evaluate `a - tanh(alpha_l) * proj_u(a)`, with all scalar layer
+gates initialized to zero. Use fixed held-out training batches continued from
+each checkpoint. Record residual alignment, a sequence-shifted residual null,
+the exact gate gradient at zero, and a centred finite-difference slope. No
+checkpoint state is written and no optimizer step is taken.
+
+**Success and stopping criteria.** Evaluate 16 fixed micro-batches at each of
+the canonical exp000 proxy and full seed-0 checkpoints; use the first four for
+the centred perturbation check at gate values `+/-0.05`.
+
+- A layer passes one checkpoint when mean alignment excess over the shifted
+  null is positive by more than two standard errors, mean gate gradient plus
+  two standard errors is below zero, at least 75% of batch gradients are
+  negative, and the centred finite-difference slope plus two standard errors
+  is below zero.
+- The mechanism gate passes only if at least one identical layer passes at
+  both proxy and full checkpoints. A full-only pass is weak/inconclusive.
+- If no layer passes at the full checkpoint, stop RCA unchanged. Do not build
+  a training experiment from alignment alone.
+- Wrong checkpoint identity or baseline arguments, changed batch continuation,
+  NaN/Inf, a non-zero weight delta, or disagreement in sign between autograd
+  and finite differences invalidates the measurement.
+
+Primary artifacts are the full branch SHA, checkpoint identities and arguments,
+per-batch/per-layer measurements, aggregate decision, elapsed time, GPU/runtime
+metadata, and stdout. Any later trainable RCA experiment requires a new
+pre-registration and a separate paid-compute approval.
