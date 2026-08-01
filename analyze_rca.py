@@ -320,6 +320,8 @@ def analyze_checkpoint(
         "checkpoint_next_step": checkpoint["next_step"],
         "checkpoint_args": checkpoint["args"],
         "checkpoint_metadata": checkpoint.get("metadata", {}),
+        "checkpoint_train_loader": checkpoint["train_loader"],
+        "input_bin": input_bin,
         "parameters_unchanged": unchanged,
         "changed_parameter": changed_parameter,
         "num_batches": num_batches,

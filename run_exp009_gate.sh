@@ -27,6 +27,26 @@ if ! compgen -G "$input_bin" >/dev/null; then
   exit 1
 fi
 
+expected_branch=exp009/rca-offline-gate
+actual_branch=$(git branch --show-current)
+if [[ "$actual_branch" != "$expected_branch" ]]; then
+  echo "expected branch ${expected_branch}, got ${actual_branch}" >&2
+  exit 1
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "tracked worktree changes would invalidate exp009" >&2
+  exit 1
+fi
+
+echo "experiment=exp009"
+echo "branch=${actual_branch}"
+echo "commit=$(git rev-parse HEAD)"
+echo "proxy_checkpoint=${proxy_checkpoint}"
+echo "full_checkpoint=${full_checkpoint}"
+echo "input_bin=${input_bin}"
+echo "output_root=${output_root}"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+
 mkdir -p "$output_root"
 "$python_bin" analyze_rca.py --self-test
 "$python_bin" analyze_rca.py \
