@@ -476,7 +476,8 @@ def health_stage(manifest, control_path, experiment, worktree, stage_dir, data, 
     )
     command = [
         sys.executable,
-        "night_suite/health_diagnostic.py",
+        "-m",
+        "night_suite.health_diagnostic",
         "--output-dir",
         str(stage_dir),
         "--input-bin",
