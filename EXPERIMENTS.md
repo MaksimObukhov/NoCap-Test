@@ -109,6 +109,7 @@ proposal's cost but does not predict a loss improvement.
 | exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
 | exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
 | exp011 | stopped at A, treatment killed | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A reduced functional concentration but lost too much first-order descent and over-amplified weaker proxy modes | Do not run B or C unchanged; any partial/descent-budgeted cap is a new experiment |
+| exp012 | planned nightly funnel | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | Awaiting same-host benchmark, 256-update health diagnostic, and proxy seed 0 | No full run tonight; promote only after the pre-registered proxy gate |
 
 ## Completed experiments
 
@@ -1206,3 +1207,34 @@ top-mode capping as implemented and frozen after B.
   challenge objective `val_loss <= 3.3821`.
 - Wrong SHA, changed treatment after B, token/order/LR mismatch, OOM, NaN,
   missing durable local artifacts, or failed W&B completion invalidates C.
+
+## exp012 — 3D MLP plus batch-ramp combination
+
+**Status:** planned. This is an intentionally joint treatment, not a clean
+ablation. No full run is authorised by this row.
+
+**Hypothesis.** At the exact exp000 proxy token prefix, combining the measured
+3D-MLP systems saving with the exact exp001 `131,072 -> 524,288` effective-batch
+ramp over the first 50% of tokens will preserve enough of exp001's loss/token
+advantage to offset exp007's capacity loss and finish at least `0.004` below
+the baseline proxy seed-0 loss, while retaining a material same-host throughput
+advantage. Adam betas remain `(0.9, 0.95)` in step time and the LR remains the
+current WSD with exp001's square-root batch scaling.
+
+**Night funnel.** First run a 50-update exact-shape systems benchmark and a
+separate 256-update no-clipping health diagnostic beginning at accumulation 8.
+The diagnostic records global and maximum gradient norm, non-finite counts,
+parameter norm, sampled update/weight ratio, and loss jumps locally and in
+W&B. It is not timing evidence. If both gates are valid, run proxy seed 0 for
+exactly `937,426,944` target tokens; the changing batch determines the number
+of optimizer updates.
+
+- Compile/eager failure, OOM, NaN/Inf, a non-finite gradient, or a reproducible
+  loss/gradient spike more than `10x` the diagnostic median kills the treatment
+  before proxy. A lone finite outlier is reported but does not auto-kill.
+- Proxy loss `<= 3.593773` passes the seed-0 quality gate. Loss
+  `>= 3.601773` kills the combination; the interval is inconclusive.
+- Same-host timing must be reported separately from quality. The exp007
+  `10.54%` result is a prior, not evidence for this new SHA.
+- Wrong SHA, dirty tracked files, changed token prefix, missing artifacts or
+  failed W&B artifact upload invalidates a stage and stops the nightly suite.
