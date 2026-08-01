@@ -931,8 +931,8 @@ branch-head SHA, not merely an exp008 directory name.
 
 ## exp009 — Residual-Complement Attention offline gate
 
-**Status:** planned measurement only. No optimizer update, proxy training, or
-promotion is authorised by this entry.
+**Status:** completed offline measurement; mechanism killed. No optimizer
+update or proxy training was performed or authorised.
 
 **Hypothesis.** At the canonical exp000 proxy and full seed-0 checkpoints, the
 post-`c_proj` attention update contains a non-random component parallel to the
@@ -999,8 +999,8 @@ Artifacts are retained under
 
 ## exp010 — Selective Spectral AdamW offline gate
 
-**Status:** planned measurement only. No capped optimizer, proxy training, or
-promotion is authorised by this entry.
+**Status:** completed offline measurement; mechanism gate passed. No capped
+optimizer or proxy training was performed or authorised.
 
 **Hypothesis.** At the canonical exp000 proxy and full seed-0 checkpoints,
 AdamW's bias-corrected preconditioned update matrices for at least one repeated
