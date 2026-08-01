@@ -1,0 +1,112 @@
+{
+  "auto_stop": "disabled",
+  "control": {
+    "branch": "exp/night-suite-harness",
+    "id": "control",
+    "sha": "__CONTROL_SHA__",
+    "treatment": "frozen 4D GELU baseline with instrumentation disabled"
+  },
+  "experiments": [
+    {
+      "benchmark_extra_args": [],
+      "benchmark_reference": "baseline",
+      "branch": "exp012/3d-batch-combo",
+      "enabled": true,
+      "health": {
+        "grad_accumulation_steps": 8,
+        "lr_scale": 0.5,
+        "updates": 256
+      },
+      "id": "exp012",
+      "minimum_speedup_pct": 3.0,
+      "proxy": {
+        "kill_loss": 3.601773,
+        "pass_loss": 3.593773
+      },
+      "proxy_extra_args": [],
+      "sha": "7423fbc80cc08212cf01e5c72aea4f22781199a8",
+      "treatment": "uniform 3D MLP plus exact exp001 128k-to-524k batch ramp"
+    },
+    {
+      "benchmark_extra_args": [],
+      "benchmark_reference": "baseline",
+      "branch": "exp013/relu2",
+      "enabled": true,
+      "health": {
+        "grad_accumulation_steps": 32,
+        "lr_scale": 1.0,
+        "updates": 256
+      },
+      "id": "exp013",
+      "minimum_speedup_pct": -3.0,
+      "proxy": {
+        "kill_loss": 3.601773,
+        "pass_loss": 3.593773
+      },
+      "proxy_extra_args": [],
+      "sha": "be085f3fde1ba3b670b3b2ebab4d5f14645be8df",
+      "treatment": "replace GELU with squared ReLU in the unchanged 4D MLP"
+    },
+    {
+      "benchmark_extra_args": [],
+      "benchmark_reference": "uniform-3d",
+      "branch": "exp014/depth-shaped-mlp",
+      "enabled": true,
+      "health": {
+        "grad_accumulation_steps": 32,
+        "lr_scale": 1.0,
+        "updates": 256
+      },
+      "id": "exp014",
+      "minimum_speedup_pct": -2.0,
+      "proxy": {
+        "kill_loss": 3.620361,
+        "pass_loss": 3.612361
+      },
+      "proxy_extra_args": [],
+      "sha": "cd87f73e61b9d4c09c4ae5395db77389fff7be71",
+      "treatment": "2.5D, 3D, 3.5D MLP widths across layer thirds"
+    },
+    {
+      "benchmark_extra_args": [],
+      "benchmark_reference": "uniform-3d",
+      "branch": "exp015/swiglu-2d",
+      "enabled": true,
+      "health": {
+        "grad_accumulation_steps": 32,
+        "lr_scale": 1.0,
+        "updates": 256
+      },
+      "id": "exp015",
+      "minimum_speedup_pct": -2.0,
+      "proxy": {
+        "kill_loss": 3.620361,
+        "pass_loss": 3.612361
+      },
+      "proxy_extra_args": [],
+      "sha": "2008e2d1f3772f61964a3786c40db0c7c731cdaa",
+      "treatment": "2D SwiGLU matched to 3D GELU leading MLP parameters and FLOPs"
+    },
+    {
+      "branch": "exp016/descent-budgeted-md-adamw",
+      "enabled": true,
+      "health": {
+        "extra_args": [
+          "--descent-budgeted-attn-v"
+        ],
+        "grad_accumulation_steps": 32,
+        "lr_scale": 1.0,
+        "updates": 128
+      },
+      "id": "exp016",
+      "proxy": {
+        "kill_loss": 3.601773,
+        "pass_loss": 3.593773
+      },
+      "sha": "a88ffa102aaf96d27dde3b4e27962b06ff4ac858",
+      "treatment": "attention-V descent-budgeted spectral reweighting of AdamW"
+    }
+  ],
+  "suite_id": "__SUITE_ID__",
+  "wandb_project": "nocap-baseline"
+}
