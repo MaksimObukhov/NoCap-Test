@@ -108,6 +108,7 @@ proposal's cost but does not predict a loss improvement.
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
 | exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
 | exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
+| exp011 | planned A/B/C funnel | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A: causal attribution; B: correctness and <=1% systems overhead; C: proxy seed 0 | Stop after each part; C remains unapproved until A and B pass |
 
 ## Completed experiments
 
@@ -1084,3 +1085,92 @@ authorised by this result.
 Artifacts are retained under
 `profiles/exp010-gate/exp010-spectral-adamw-gate-20260801T125712Z/` and remain
 untracked.
+
+## exp011 — Attention-V Selective Spectral AdamW
+
+**Status:** planned staged experiment. Parts A, B, and C share one treatment,
+branch, and experiment identity, but each has a separate launcher and stop gate.
+Only A is initially approved for execution. A pass permits review of B; an A+B
+pass permits consideration, not automatic launch, of C.
+
+**Treatment and causal hypothesis.** For each layer's V rows inside the fused
+attention input projection, reconstruct AdamW's bias-corrected preconditioned
+update `A`. Estimate its first two singular modes and define
+
+```text
+C = (sigma_1 - sigma_2) * u_1 v_1^T
+A_cap = ||A||_F / ||A - C||_F * (A - C)
+```
+
+All Q/K rows, attention output matrices, MLP matrices, embeddings, AdamW
+moments, weight decay, LR schedule, data order, model, and evaluation remain
+unchanged. The hypothesis is that the excessive V leading mode causes a
+disproportionate functional movement while contributing little unique
+first-order descent; removing only its excess and matching update norm will
+improve loss per token without Muon's all-mode flattening.
+
+**Main transfer risks.** The leading mode may be useful signal, not domination;
+activation covariance may have caused exp010's concentrated `X A^T`; Frobenius
+matching may amplify weaker noisy modes; a warm-started rank-two estimate may
+lag or misorder close modes; modifying only a slice of fused QKV state may be
+incorrect; and extra optimizer kernels may erase any quality gain in the
+compile-inclusive objective.
+
+### exp011-A — causal component attribution
+
+Freeze weights and replay the same eight effective batches from both canonical
+exp000 proxy and full seed-0 checkpoints. For every layer's attention-V update,
+compute converged rank-two `C`, norm-matched `A_cap`, and sampled functional
+effects before and after capping. Record:
+
+- relative reduction in leading energy of `X A^T`;
+- first-order descent retention `<G, A_cap> / <G, A>`;
+- Frobenius rescale factor and the fraction of records retaining at least 95%
+  of predicted descent.
+
+A passes one checkpoint only when the median functional leading-energy
+reduction is at least 10%, median descent retention is at least 98%, at least
+75% of layer/update records retain 95% of descent, and the median norm rescale
+is no greater than 1.05. It passes overall only at both proxy and full. A
+non-positive total descent denominator, parameter movement, missing state,
+NaN/Inf, wrong checkpoint provenance, or failed synthetic cap test invalidates
+the measurement. Failure stops exp011 before implementation.
+
+### exp011-B — implementation correctness and systems gate
+
+Implement the same cap with a persistent warm-started rank-two subspace: four
+block-power iterations on its first use and one iteration on later optimizer
+updates. Store the subspace in optimizer state so checkpoint resume is exact.
+Apply ordinary AdamW first, then correct only V rows to the norm-matched capped
+preconditioned update; verify all non-V updates match the AdamW control.
+
+Run fresh control and treatment processes for 50 exact-shape baseline optimizer
+updates on one sustained-clock RTX 4090. Measure initial compile/warm-up,
+complete-update times, updates 11--48, peak memory, compile/recompile evidence,
+early loss health, and the treatment's cap/rescale diagnostics.
+
+- Median complete-update overhead for updates 11--48 must be at most 1.0%.
+- Projected total optimizer overhead across the 1,788-update proxy must be at
+  most 1.0%; no hidden model recompile is allowed.
+- Synthetic update equivalence, zero-gap identity, V-only correction, optimizer
+  state round-trip, and deterministic resume tests must pass.
+- OOM, NaN/Inf, non-V mismatch, dirty/wrong SHA, or timing noise too large to
+  resolve a 1% boundary invalidates B. Failure stops before C.
+
+### exp011-C — proxy seed 0
+
+Only after explicit review and approval of A and B, train from scratch for the
+exact exp000 proxy budget: seed 0, 1,788 updates, 937,426,944 target tokens,
+unchanged FineWeb order, `B=16`, `T=1024`, accumulation 32, LR schedule,
+validation, checkpointing, and W&B project. The sole treatment is attention-V
+top-mode capping as implemented and frozen after B.
+
+- Final validation loss `<= 3.593773` passes the seed-0 quality gate and permits
+  consideration of seeds 1/2.
+- Final validation loss `>= 3.601773` kills exp011 unchanged.
+- The interval between those thresholds is inconclusive.
+- Compile-inclusive time-to-target remains unproven until an eventual full run
+  is compared with a same-host baseline. C cannot by itself establish the
+  challenge objective `val_loss <= 3.3821`.
+- Wrong SHA, changed treatment after B, token/order/LR mismatch, OOM, NaN,
+  missing durable local artifacts, or failed W&B completion invalidates C.
