@@ -108,7 +108,7 @@ proposal's cost but does not predict a loss improvement.
 | exp008 | completed proxy s0, quality killed | Replace 12-head MHA with 12-query-head, 4-KV-head GQA; keep model width and the rest of training fixed | 3.617567, delta +0.019794 vs baseline s0: 0.015794 above the pre-registered KILL threshold | Stop unchanged GQA; no seeds 1/2. Same-host MHA-vs-GQA timing remains unmeasured, so no speedup claim |
 | exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
 | exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
-| exp011 | planned A/B/C funnel | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A: causal attribution; B: correctness and <=1% systems overhead; C: proxy seed 0 | Stop after each part; C remains unapproved until A and B pass |
+| exp011 | stopped at A, treatment killed | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A reduced functional concentration but lost too much first-order descent and over-amplified weaker proxy modes | Do not run B or C unchanged; any partial/descent-budgeted cap is a new experiment |
 
 ## Completed experiments
 
@@ -1088,10 +1088,9 @@ untracked.
 
 ## exp011 — Attention-V Selective Spectral AdamW
 
-**Status:** planned staged experiment. Parts A, B, and C share one treatment,
-branch, and experiment identity, but each has a separate launcher and stop gate.
-Only A is initially approved for execution. A pass permits review of B; an A+B
-pass permits consideration, not automatic launch, of C.
+**Status:** stopped at A; the full-gap attention-V treatment is killed. B and C
+were not run and remain unauthorised. Any partial or descent-budgeted cap is a
+new treatment requiring a new experiment identity and pre-registration.
 
 **Treatment and causal hypothesis.** For each layer's V rows inside the fused
 attention input projection, reconstruct AdamW's bias-corrected preconditioned
@@ -1135,6 +1134,39 @@ is no greater than 1.05. It passes overall only at both proxy and full. A
 non-positive total descent denominator, parameter movement, missing state,
 NaN/Inf, wrong checkpoint provenance, or failed synthetic cap test invalidates
 the measurement. Failure stops exp011 before implementation.
+
+**A result (1 August 2026).** Clean branch SHA
+`b972f54b63bc3d5c47ab532e9aebbc7d2c5405f0` replayed eight effective batches
+at each canonical exp000 checkpoint on one RTX 4090 with PyTorch 2.11/CUDA
+12.8. The synthetic cap test passed, both checkpoint parameter sets remained
+exactly unchanged, and 96 layer/update records were measured per checkpoint in
+114.63 seconds. The overall decision was **KILL**.
+
+| A metric | Proxy checkpoint | Full checkpoint | Required |
+|---|---:|---:|---:|
+| Median functional leading-energy reduction | 0.2794 | 0.1407 | >= 0.10 |
+| Median first-order descent retention | 0.8817 | 0.9583 | >= 0.98 |
+| Fraction retaining at least 95% descent | 0.1250 | 0.6458 | >= 0.75 |
+| Median Frobenius norm rescale | 1.0911 | 1.0276 | <= 1.05 |
+
+The cap did reduce functional concentration, so exp010's spectral observation
+was real. However, at the proxy checkpoint it removed a median 11.8% of
+predicted descent and norm matching amplified the remaining modes by 9.1%; only
+12 of 96 records retained at least 95% descent. At the full checkpoint it still
+removed a median 4.2% of descent, and only 62 of 96 records met the 95%
+retention threshold. The leading mode therefore contains substantial useful
+signal rather than being an almost-free excess component.
+
+This falsifies the pre-registered full-gap rule `sigma_1 -> sigma_2`. Do not run
+the implementation benchmark B or proxy C unchanged. A proxy could in principle
+show a longer-horizon regularisation effect despite this local result, but that
+was not the exp011 hypothesis and overriding the stopping gate after observing
+A would be exploratory post-hoc work. A partial or descent-budgeted cap may be
+formulated separately, but cannot be relabelled as a continuation or pass of
+exp011.
+
+Artifacts are retained under
+`profiles/exp011-gate/exp011-a-20260801T133033Z/` and remain untracked.
 
 ### exp011-B — implementation correctness and systems gate
 
