@@ -100,10 +100,15 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_index):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        if config.n_layer != 12:
+            raise ValueError("exp014 depth shape is defined only for d12")
+        ratios = (2.5, 3.0, 3.5)
+        hidden_width = int(ratios[layer_index // 4] * config.n_embd)
+        self.hidden_width = hidden_width
+        self.c_fc = nn.Linear(config.n_embd, hidden_width, bias=False)
+        self.c_proj = nn.Linear(hidden_width, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -114,10 +119,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_index):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_index)
         self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
 
     def forward(self, x):
@@ -147,7 +152,9 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList(
+                    [Block(config, layer_index) for layer_index in range(config.n_layer)]
+                ),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
