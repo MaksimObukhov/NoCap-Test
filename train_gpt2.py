@@ -416,6 +416,11 @@ if __name__ == "__main__":
         help="overwrite the resumable checkpoint every N updates; 0 disables periodic saves",
     )
     parser.add_argument(
+        "--skip_final_checkpoint",
+        action="store_true",
+        help="skip the final checkpoint for disposable benchmark stages",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="capture a short CPU/CUDA profiler trace",
@@ -835,7 +840,8 @@ if __name__ == "__main__":
     )
 
     if master_process:
-        save_checkpoint(args.num_iterations)
+        if not args.skip_final_checkpoint:
+            save_checkpoint(args.num_iterations)
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
