@@ -548,11 +548,10 @@ class ArgumentMerging(unittest.TestCase):
 
     def test_every_shipped_proxy_command_is_wellformed(self):
         """No duplicate flags and no strays across the whole manifest."""
-        import types
-
         manifest = suite.load_manifest(os.path.join(HERE, "manifest.json"))
         options = types.SimpleNamespace(
             python="python",
+            torchrun="torchrun",
             train_glob="/data/train_*.bin",
             val_glob="/data/val_*.bin",
             log_wandb=True,
@@ -585,6 +584,65 @@ class ArgumentMerging(unittest.TestCase):
         pairs = dict(suite.parse_arg_pairs(merged))
         self.assertEqual(pairs["--mlp_ratio"], "2.0")
         self.assertEqual(pairs["--batch_ramp_start_accumulation_steps"], "8")
+
+
+class TrainingLaunch(unittest.TestCase):
+    """train_gpt2.py must be launched through torchrun, never as a script.
+
+    It reads RANK, LOCAL_RANK and WORLD_SIZE from the environment and calls
+    init_process_group, so a plain `python train_gpt2.py` raises KeyError on
+    RANK about three seconds in. The first v3 attempt did exactly that and
+    failed every training stage on the instance while every
+    command-construction test still passed -- constructing a command
+    correctly is not the same as being able to run it.
+    """
+
+    def options(self):
+        return types.SimpleNamespace(
+            python="/venv/main/bin/python",
+            torchrun="/venv/main/bin/torchrun",
+            train_glob="/data/train_*.bin",
+            val_glob="/data/val_*.bin",
+            log_wandb=False,
+        )
+
+    def command_for(self, mode):
+        manifest = suite.load_manifest(os.path.join(HERE, "manifest.json"))
+        return suite.training_command(
+            manifest, "exp017", "proxy-seed-0", mode, [], "/out", self.options()
+        )
+
+    def test_proxy_uses_torchrun_at_world_size_one(self):
+        command = self.command_for("proxy")
+        self.assertEqual(command[0], "/venv/main/bin/torchrun")
+        self.assertIn("--standalone", command)
+        self.assertIn("--nproc_per_node=1", command)
+        self.assertEqual(command[3], "train_gpt2.py")
+
+    def test_benchmark_uses_torchrun_too(self):
+        command = self.command_for("benchmark")
+        self.assertEqual(command[0], "/venv/main/bin/torchrun")
+        self.assertIn("--nproc_per_node=1", command)
+
+    def test_training_is_never_launched_as_a_plain_script(self):
+        for mode in ("proxy", "benchmark"):
+            command = self.command_for(mode)
+            self.assertNotEqual(
+                command[0],
+                "/venv/main/bin/python",
+                f"{mode} would raise KeyError on RANK",
+            )
+
+    def test_preflight_only_flag_exists_in_the_training_entry_point(self):
+        """The launch check depends on this flag; it must not drift away."""
+        source = read_text(os.path.join(REPO_ROOT, "train_gpt2.py"))
+        self.assertIn('"--preflight_only"', source)
+        self.assertIn("if args.preflight_only:", source)
+        # It has to exit before the expensive part, or the check is not cheap.
+        self.assertLess(
+            source.index("if args.preflight_only:"),
+            source.index("base_model = GPT(model_config)"),
+        )
 
 
 class ManifestArithmetic(unittest.TestCase):

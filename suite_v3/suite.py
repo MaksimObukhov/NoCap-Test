@@ -23,6 +23,7 @@ import shlex
 import subprocess
 import sys
 import time
+import types
 
 from suite_v3 import gates
 
@@ -225,6 +226,65 @@ def preflight(manifest, worktrees, data_glob, results_root, minimum_free_gib):
     return report
 
 
+def preflight_launch_check(manifest, experiments, worktrees, options, ledger):
+    """Actually start each training entry point, briefly.
+
+    Constructing a command correctly is not the same as being able to run it.
+    The first v3 attempt built flawless argument lists and then died three
+    seconds into every training stage, because train_gpt2.py needs the
+    distributed environment that torchrun supplies and was being launched as
+    a plain script. No amount of command-construction testing catches that;
+    only launching does.
+
+    --preflight_only exits before the model is built, so this costs a few
+    seconds per experiment rather than a compile.
+    """
+    checked = {}
+    for experiment in experiments:
+        if "proxy" not in experiment["stages"]:
+            continue
+        spec = experiment["proxy"]
+        if spec.get("use_exp012_stack_ramp"):
+            extra = merge_args(
+                manifest["common_args"]["exp012_stack"], spec.get("extra_args", [])
+            )
+        else:
+            extra = merge_args(spec.get("extra_args", []))
+        extra = merge_args(extra, ["--preflight_only"])
+
+        scratch = os.path.join(options.results_root, "_preflight", experiment["id"])
+        command = training_command(
+            manifest,
+            experiment["id"],
+            "preflight",
+            "proxy",
+            extra,
+            scratch,
+            types.SimpleNamespace(
+                torchrun=options.torchrun,
+                train_glob=options.train_glob,
+                val_glob=options.val_glob,
+                log_wandb=False,
+            ),
+        )
+        log_path = os.path.join(scratch, "stdout.log")
+        code = run_logged(command, worktrees[experiment["id"]], log_path)
+        checked[experiment["id"]] = code
+        ledger.append(
+            "preflight_launch", experiment=experiment["id"], exit_code=code
+        )
+        if code != 0:
+            tail = ""
+            if os.path.exists(log_path):
+                with open(log_path) as handle:
+                    tail = "".join(handle.readlines()[-15:])
+            raise InfrastructureFailure(
+                f"{experiment['id']} cannot start its proxy stage (exit {code}). "
+                f"Last output:\n{tail}"
+            )
+    return checked
+
+
 # ---------------------------------------------------------------------------
 # Stage identity and reuse
 
@@ -322,14 +382,25 @@ def merge_args(*groups):
 def training_command(
     manifest, experiment_id, stage_name, mode, extra_args, output_dir, options
 ):
+    """Build a training invocation.
+
+    train_gpt2.py reads RANK, LOCAL_RANK and WORLD_SIZE from the environment
+    and calls init_process_group, so it must be launched through torchrun
+    even at world size 1. Launching it as a plain script raises KeyError on
+    RANK about three seconds in, which is exactly how the first v3 attempt
+    failed every training stage.
+    """
     tail = ["--input_bin", options.train_glob]
     if mode == "proxy":
         tail += ["--input_val_bin", options.val_glob]
     tail += ["--output_dir", output_dir]
     tail += wandb_args(manifest, experiment_id, stage_name, options.log_wandb)
-    return [options.python, "train_gpt2.py"] + merge_args(
-        manifest["common_args"][mode], extra_args, tail
-    )
+    return [
+        options.torchrun,
+        "--standalone",
+        "--nproc_per_node=1",
+        "train_gpt2.py",
+    ] + merge_args(manifest["common_args"][mode], extra_args, tail)
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +920,11 @@ def main():
     parser.add_argument("--val-glob", required=True)
     parser.add_argument("--checkpoint-root", default=".")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--torchrun",
+        default="",
+        help="torchrun binary; defaults to the one beside --python",
+    )
     parser.add_argument("--minimum-free-gib", type=float, default=40.0)
     parser.add_argument("--only", default="", help="comma-separated experiment IDs")
     parser.add_argument("--force", action="store_true", help="ignore stage reuse")
@@ -859,6 +935,12 @@ def main():
         help="actually execute; without it the suite plans and exits",
     )
     options = parser.parse_args()
+    if not options.torchrun:
+        # train_gpt2.py needs torchrun's distributed environment even at
+        # world size 1, so resolve it beside the interpreter we were given
+        # rather than hoping it is on PATH.
+        beside = os.path.join(os.path.dirname(options.python), "torchrun")
+        options.torchrun = beside if os.path.exists(beside) else "torchrun"
 
     manifest = load_manifest(options.manifest)
     experiments = sorted(
@@ -883,6 +965,7 @@ def main():
         print(f"suite_id            : {manifest['suite_id']}")
         print(f"results root        : {options.results_root}")
         print(f"experiments enabled : {len(experiments)}")
+        print(f"torchrun            : {options.torchrun}")
         total = 0
         for experiment in experiments:
             total += experiment.get("expected_minutes", 0)
@@ -932,6 +1015,7 @@ def main():
             report,
         )
         ledger.append("preflight", attempt=attempt, status="pass")
+        preflight_launch_check(manifest, experiments, worktrees, options, ledger)
 
         materialized = materialize(manifest, worktrees)
         manifest_hash = stable_hash(materialized)

@@ -573,6 +573,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--preflight_only",
+        action="store_true",
+        help=(
+            "validate arguments, the distributed environment and the data "
+            "globs, then exit before building or compiling the model"
+        ),
+    )
+    parser.add_argument(
         "--milestone_every",
         type=int,
         default=0,
@@ -887,6 +895,22 @@ if __name__ == "__main__":
             vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600, mlp_ratio=ratio
         ),
     }[args.model]
+    if args.preflight_only:
+        # Everything expensive is still ahead: model construction, compile,
+        # and the run itself. Everything that can fail cheaply has already
+        # happened -- argument parsing and validation, the torchrun-supplied
+        # distributed environment, and both data loaders resolving their
+        # shard globs. Exiting here proves a stage can actually start for a
+        # few seconds instead of discovering it at three in the morning.
+        print0(
+            f"preflight ok: rank {ddp_rank}/{ddp_world_size} | "
+            f"target {target_tokens:,} tokens | mlp_ratio {args.mlp_ratio} | "
+            f"grad_clip {args.grad_clip} | schedule warmup {warmup_tokens:,} "
+            f"warmdown {warmdown_tokens:,}"
+        )
+        destroy_process_group()
+        sys.exit(0)
+
     base_model = GPT(model_config)
     parameter_count = sum(p.numel() for p in base_model.parameters())
     print0(
