@@ -1970,12 +1970,13 @@ command after exp023 and an FP8 proxy.
 systems benchmark only, not FP8 proxy or full training.
 
 **Treatment.** After exp022 selects the architecture, instantiate that winner
-with one BF16 master tied embedding/head weight padded from 50,257 to 50,304
+with one FP32 master tied embedding/head weight padded from 50,257 to 50,304
 rows. Both control and FP8 treatment use the identical padded parameter and
 slice logits back to the true first 50,257 classes before cross-entropy. The
 padding is therefore a compute-shape device, not a vocabulary or objective
 change. Convert only the inner lm-head linear to TorchAO FP8 training; the
-embedding lookup and optimizer master weight remain BF16.
+embedding lookup uses the shared FP32 master under the existing BF16 autocast,
+and the optimizer master weight remains FP32.
 
 **Measurement.** On the same RTX 4090, run control-before, FP8 treatment and
 control-after for identical fixed inputs and exact production full updates.
