@@ -7,13 +7,12 @@ OUTPUT_DIR="${3:-}"
 EXPERIMENT_ID="exp021"
 EXPERIMENT_SLUG="aggressive-small-batch-ramp"
 
-if [[ "$MODE" != "proxy" ]]; then
-  echo "usage: $0 proxy [seed] [output_dir] [extra train_gpt2.py args...]" >&2
-  echo "exp021 intentionally exposes only the preregistered proxy stage" >&2
+if [[ "$MODE" != "proxy" && "$MODE" != "full" ]]; then
+  echo "usage: $0 {proxy|full} [seed] [output_dir] [extra train_gpt2.py args...]" >&2
   exit 2
 fi
 if [[ "$SEED" != "0" ]]; then
-  echo "exp021 currently authorises proxy seed 0 only" >&2
+  echo "exp021 currently authorises seed 0 only" >&2
   exit 2
 fi
 
@@ -23,11 +22,26 @@ else
   shift "$#"
 fi
 
-NUM_ITERATIONS=3576
-WARMUP_ITERS=192
-WARMDOWN_ITERS=768
-VAL_LOSS_EVERY=256
-SAVE_EVERY=512
+case "$MODE" in
+  proxy)
+    NUM_ITERATIONS=3576
+    WARMUP_ITERS=192
+    WARMDOWN_ITERS=768
+    VAL_LOSS_EVERY=256
+    SAVE_EVERY=512
+    MILESTONE_START_ITERS=0
+    MILESTONE_EVERY=0
+    ;;
+  full)
+    NUM_ITERATIONS=10300
+    WARMUP_ITERS=553
+    WARMDOWN_ITERS=2212
+    VAL_LOSS_EVERY=256
+    SAVE_EVERY=512
+    MILESTONE_START_ITERS=8088
+    MILESTONE_EVERY=256
+    ;;
+esac
 
 DATA_DIR="${NOCAP_DATA_DIR:-}"
 if [[ -z "$DATA_DIR" ]]; then
@@ -48,10 +62,10 @@ fi
 if [[ -z "$OUTPUT_DIR" ]]; then
   RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
   OUTPUT_ROOT="${NOCAP_OUTPUT_ROOT:-/workspace/nocap-results}"
-  OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_ID}-${RUN_TIMESTAMP}/proxy-seed-${SEED}"
+  OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_ID}-${RUN_TIMESTAMP}/${MODE}-seed-${SEED}"
 fi
 
-RUN_NAME="${EXPERIMENT_ID}-${EXPERIMENT_SLUG}-proxy-seed-${SEED}"
+RUN_NAME="${EXPERIMENT_ID}-${EXPERIMENT_SLUG}-${MODE}-seed-${SEED}"
 WANDB_ARGS=()
 if [[ "${WANDB_ENABLED:-1}" == "1" ]]; then
   WANDB_ARGS+=(
@@ -90,6 +104,8 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --warmup_iters "$WARMUP_ITERS" \
   --warmdown_iters "$WARMDOWN_ITERS" \
   --save_every "$SAVE_EVERY" \
+  --milestone_start_iter "$MILESTONE_START_ITERS" \
+  --milestone_every "$MILESTONE_EVERY" \
   --abort_on_nonfinite \
   "${WANDB_ARGS[@]}" \
   "$@"

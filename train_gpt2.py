@@ -451,6 +451,18 @@ if __name__ == "__main__":
         help="save latest.pt every N final-batch-equivalent updates; 0 disables",
     )
     parser.add_argument(
+        "--milestone_start_iter",
+        type=int,
+        default=0,
+        help="first final-batch-equivalent update eligible for immutable milestones",
+    )
+    parser.add_argument(
+        "--milestone_every",
+        type=int,
+        default=0,
+        help="immutable milestone interval in final-batch-equivalent updates",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="capture a short CPU/CUDA profiler trace",
@@ -503,6 +515,9 @@ if __name__ == "__main__":
         ), "batch ramp must grow toward --grad_accumulation_steps"
     assert args.lr_reference_batch_tokens >= 0
     assert args.save_every >= 0
+    assert args.milestone_start_iter >= 0
+    assert args.milestone_every >= 0
+    assert (args.milestone_start_iter == 0) == (args.milestone_every == 0)
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
     assert args.profile_active_steps > 0
@@ -565,6 +580,8 @@ if __name__ == "__main__":
             "warmup_iters",
             "warmdown_iters",
             "weight_decay",
+            "milestone_start_iter",
+            "milestone_every",
         )
         for key in resume_keys:
             checkpoint_value = resume_checkpoint["args"].get(key, 0)
@@ -660,6 +677,8 @@ if __name__ == "__main__":
     warmdown_tokens = args.warmdown_iters * final_tokens_per_update
     validation_interval_tokens = args.val_loss_every * final_tokens_per_update
     save_interval_tokens = args.save_every * final_tokens_per_update
+    milestone_start_tokens = args.milestone_start_iter * final_tokens_per_update
+    milestone_interval_tokens = args.milestone_every * final_tokens_per_update
     ramp_start_accumulation = (
         args.batch_ramp_start_accumulation_steps
         or args.grad_accumulation_steps
@@ -786,6 +805,13 @@ if __name__ == "__main__":
             return None
         if kind == "latest":
             destination = latest_checkpoint_path
+        elif kind == "milestone":
+            destination = os.path.join(
+                checkpoint_dir, f"milestone-tokens{tokens_seen:012d}.pt"
+            )
+            if os.path.exists(destination):
+                print0(f"milestone already exists, not rewriting: {destination}")
+                return destination
         elif kind == "final":
             destination = final_checkpoint_path
         else:
@@ -1026,6 +1052,20 @@ if __name__ == "__main__":
         if crossed_save_boundary:
             save_checkpoint(completed_steps, kind="latest")
 
+        crossed_milestone_boundary = False
+        if args.milestone_every > 0 and tokens_seen >= milestone_start_tokens:
+            if previous_tokens_seen < milestone_start_tokens:
+                crossed_milestone_boundary = True
+            else:
+                crossed_milestone_boundary = (
+                    (tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                    > (previous_tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                )
+        if crossed_milestone_boundary:
+            save_checkpoint(completed_steps, kind="milestone")
+
         if profiler is not None:
             # One profiler step is one complete optimizer update, including accumulation.
             profiler.step()
@@ -1095,6 +1135,12 @@ if __name__ == "__main__":
             "next_step": completed_steps,
             "tokens_seen": tokens_seen,
         }
+        summary["milestone_checkpoints"] = [
+            {"path": path, "bytes": os.path.getsize(path)}
+            for path in sorted(
+                glob.glob(os.path.join(checkpoint_dir, "milestone-tokens*.pt"))
+            )
+        ]
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
