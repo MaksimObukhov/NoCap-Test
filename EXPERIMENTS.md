@@ -1958,7 +1958,8 @@ inputs are saved as JSON. A completed proxy must retain `final.pt` and its W&B
 artifact.
 
 **Conditional full.** The winning BF16 branch runs seed 0 to the exact
-`2,700,001,280`-token budget (a multiple of the 16,384-token microbatch) with
+`2,700,083,200`-token budget (10,300 final-batch-equivalent updates and a
+multiple of the 262,144-token final effective batch) with
 the same token-indexed schedule fractions and a clean compile cache. FP8 is
 excluded. A later hardware-optimised full requires a separate explicit user
 command after exp023 and an FP8 proxy.
