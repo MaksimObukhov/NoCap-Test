@@ -277,18 +277,59 @@ def wandb_args(manifest, experiment_id, stage_name, log_wandb):
     ]
 
 
+def parse_arg_pairs(tokens):
+    """Split a flat argument list into (flag, value) pairs.
+
+    Raises on a stray positional. That is not pedantry: an earlier version of
+    the stack merge appended a value without its flag, producing
+    `--grad_clip 10.0 3.0`, which argparse would have rejected only after the
+    process had already been launched on a paid instance.
+    """
+    pairs = []
+    index = 0
+    while index < len(tokens):
+        flag = tokens[index]
+        if not flag.startswith("--"):
+            raise ValueError(f"stray positional argument {flag!r} in {tokens}")
+        if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+            pairs.append((flag, tokens[index + 1]))
+            index += 2
+        else:
+            pairs.append((flag, None))
+            index += 1
+    return pairs
+
+
+def merge_args(*groups):
+    """Merge argument lists so each flag appears exactly once, later winning.
+
+    argparse would take the last value anyway, but a recorded command that
+    lists --warmdown_iters twice with different values is not a record anyone
+    should have to reason about when auditing what actually ran.
+    """
+    merged = {}
+    for group in groups:
+        for flag, value in parse_arg_pairs(group or []):
+            merged[flag] = value
+    flattened = []
+    for flag, value in merged.items():
+        flattened.append(flag)
+        if value is not None:
+            flattened.append(value)
+    return flattened
+
+
 def training_command(
     manifest, experiment_id, stage_name, mode, extra_args, output_dir, options
 ):
-    command = [options.python, "train_gpt2.py"]
-    command += list(manifest["common_args"][mode])
-    command += list(extra_args)
-    command += ["--input_bin", options.train_glob]
+    tail = ["--input_bin", options.train_glob]
     if mode == "proxy":
-        command += ["--input_val_bin", options.val_glob]
-    command += ["--output_dir", output_dir]
-    command += wandb_args(manifest, experiment_id, stage_name, options.log_wandb)
-    return command
+        tail += ["--input_val_bin", options.val_glob]
+    tail += ["--output_dir", output_dir]
+    tail += wandb_args(manifest, experiment_id, stage_name, options.log_wandb)
+    return [options.python, "train_gpt2.py"] + merge_args(
+        manifest["common_args"][mode], extra_args, tail
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -383,15 +424,14 @@ def run_benchmark(
 
 def run_proxy(manifest, experiment, worktree, stage_dir, options, ledger):
     spec = experiment["proxy"]
-    extra = list(spec.get("extra_args", []))
+    # The exp012 stack supplies the ramp and its default 3.0 ratio; the
+    # experiment's own flags come second and win, so exp019 keeps 2.0.
     if spec.get("use_exp012_stack_ramp"):
-        for token in manifest["common_args"]["exp012_stack"]:
-            # --mlp_ratio may already be supplied by the experiment.
-            if token == "--mlp_ratio" and "--mlp_ratio" in extra:
-                continue
-            extra.append(token)
-        # Drop the stack's ratio value if the experiment overrode the flag.
-        extra = _drop_duplicate_flag_values(extra, "--mlp_ratio")
+        extra = merge_args(
+            manifest["common_args"]["exp012_stack"], spec.get("extra_args", [])
+        )
+    else:
+        extra = merge_args(spec.get("extra_args", []))
 
     envelope = manifest["envelopes"].get(spec.get("envelope_reference"))
     if envelope:
@@ -434,27 +474,6 @@ def run_proxy(manifest, experiment, worktree, stage_dir, options, ledger):
         for phase in ("warmup", "steady", "warmdown")
     }
     return decision, [command]
-
-
-def _drop_duplicate_flag_values(tokens, flag):
-    """Keep only the first occurrence of `flag` and its value."""
-    output = []
-    seen = False
-    index = 0
-    while index < len(tokens):
-        if tokens[index] == flag:
-            if seen:
-                index += 2
-                continue
-            seen = True
-            output.append(tokens[index])
-            if index + 1 < len(tokens):
-                output.append(tokens[index + 1])
-            index += 2
-            continue
-        output.append(tokens[index])
-        index += 1
-    return output
 
 
 def run_checkpoint_validation(manifest, experiment, stage_dir, options, ledger):

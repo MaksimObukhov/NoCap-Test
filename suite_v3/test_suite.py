@@ -506,6 +506,85 @@ class NoFullRun(unittest.TestCase):
         self.assertNotIn("run_one full", legacy)
 
 
+class ArgumentMerging(unittest.TestCase):
+    """Caught a real bug before it reached a paid instance.
+
+    The first stack merge appended a value without its flag, producing
+    `--grad_clip 10.0 3.0` for exp019. argparse would have rejected that only
+    after the process was already running on the GPU.
+    """
+
+    def test_stray_positional_is_rejected(self):
+        with self.assertRaises(ValueError):
+            suite.parse_arg_pairs(["--grad_clip", "10.0", "3.0"])
+
+    def test_later_group_wins(self):
+        merged = suite.merge_args(
+            ["--mlp_ratio", "3.0", "--batch_ramp_fraction", "0.5"],
+            ["--mlp_ratio", "2.0", "--grad_clip", "10.0"],
+        )
+        pairs = dict(suite.parse_arg_pairs(merged))
+        self.assertEqual(pairs["--mlp_ratio"], "2.0")
+        self.assertEqual(pairs["--batch_ramp_fraction"], "0.5")
+        self.assertEqual(pairs["--grad_clip"], "10.0")
+
+    def test_each_flag_appears_once(self):
+        merged = suite.merge_args(
+            ["--warmdown_iters", "384"], ["--warmdown_iters", "0"]
+        )
+        self.assertEqual(merged.count("--warmdown_iters"), 1)
+        self.assertEqual(merged, ["--warmdown_iters", "0"])
+
+    def test_store_true_flags_survive(self):
+        merged = suite.merge_args(["--abort_on_nonfinite"], ["--mlp_ratio", "3.0"])
+        self.assertIn("--abort_on_nonfinite", merged)
+        self.assertEqual(dict(suite.parse_arg_pairs(merged))["--abort_on_nonfinite"], None)
+
+    def test_negative_values_are_values_not_flags(self):
+        pairs = dict(suite.parse_arg_pairs(["--minimum_speedup_pct", "-3.0"]))
+        self.assertEqual(pairs["--minimum_speedup_pct"], "-3.0")
+
+    def test_every_shipped_proxy_command_is_wellformed(self):
+        """No duplicate flags and no strays across the whole manifest."""
+        import types
+
+        manifest = suite.load_manifest(os.path.join(HERE, "manifest.json"))
+        options = types.SimpleNamespace(
+            python="python",
+            train_glob="/data/train_*.bin",
+            val_glob="/data/val_*.bin",
+            log_wandb=True,
+        )
+        for experiment in manifest["experiments"]:
+            if "proxy" not in experiment["stages"]:
+                continue
+            spec = experiment["proxy"]
+            if spec.get("use_exp012_stack_ramp"):
+                extra = suite.merge_args(
+                    manifest["common_args"]["exp012_stack"], spec.get("extra_args", [])
+                )
+            else:
+                extra = suite.merge_args(spec.get("extra_args", []))
+            command = suite.training_command(
+                manifest, experiment["id"], "proxy-seed-0", "proxy", extra, "/out", options
+            )
+            flags = [token for token in command if token.startswith("--")]
+            self.assertEqual(
+                len(flags), len(set(flags)), f"{experiment['id']} has duplicate flags"
+            )
+            suite.parse_arg_pairs(command[2:])
+
+    def test_exp019_keeps_its_own_ratio_over_the_stack_default(self):
+        manifest = suite.load_manifest(os.path.join(HERE, "manifest.json"))
+        exp019 = next(e for e in manifest["experiments"] if e["id"] == "exp019")
+        merged = suite.merge_args(
+            manifest["common_args"]["exp012_stack"], exp019["proxy"]["extra_args"]
+        )
+        pairs = dict(suite.parse_arg_pairs(merged))
+        self.assertEqual(pairs["--mlp_ratio"], "2.0")
+        self.assertEqual(pairs["--batch_ramp_start_accumulation_steps"], "8")
+
+
 class ManifestArithmetic(unittest.TestCase):
     """Derive the preregistered parameter counts instead of trusting them.
 
