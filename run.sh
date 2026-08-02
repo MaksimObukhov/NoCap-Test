@@ -4,9 +4,12 @@ set -euo pipefail
 MODE="${1:-}"
 SEED="${2:-0}"
 OUTPUT_DIR="${3:-}"
+EXPERIMENT_ID="exp021"
+EXPERIMENT_SLUG="aggressive-small-batch-ramp"
 
-if [[ -z "$MODE" ]]; then
-  echo "usage: $0 {smoke|proxy|full} [seed] [output_dir] [extra train_gpt2.py args...]" >&2
+if [[ "$MODE" != "proxy" ]]; then
+  echo "usage: $0 proxy [seed] [output_dir] [extra train_gpt2.py args...]" >&2
+  echo "exp021 intentionally exposes only the preregistered proxy stage" >&2
   exit 2
 fi
 
@@ -16,69 +19,73 @@ else
   shift "$#"
 fi
 
-case "$MODE" in
-  full)
-    NUM_ITERATIONS=4768
-    WARMUP_ITERS=256
-    WARMDOWN_ITERS=1024
-    SAVE_EVERY=512
-    ;;
-  proxy)
-    NUM_ITERATIONS=1788
-    WARMUP_ITERS=96
-    WARMDOWN_ITERS=384
-    SAVE_EVERY=256
-    ;;
-  smoke)
-    NUM_ITERATIONS=596
-    WARMUP_ITERS=32
-    WARMDOWN_ITERS=128
-    SAVE_EVERY=128
-    ;;
-  *)
-    echo "unknown mode: $MODE (expected smoke, proxy, or full)" >&2
+NUM_ITERATIONS=3576
+WARMUP_ITERS=192
+WARMDOWN_ITERS=768
+VAL_LOSS_EVERY=256
+SAVE_EVERY=512
+
+DATA_DIR="${NOCAP_DATA_DIR:-}"
+if [[ -z "$DATA_DIR" ]]; then
+  if [[ -d "/workspace/nocap-control/data/fineweb10B" ]]; then
+    DATA_DIR="/workspace/nocap-control/data/fineweb10B"
+  elif [[ -d "$PWD/data/fineweb10B" ]]; then
+    DATA_DIR="$PWD/data/fineweb10B"
+  else
+    echo "dataset not found; set NOCAP_DATA_DIR to the absolute fineweb10B directory" >&2
     exit 2
-    ;;
-esac
+  fi
+fi
+if [[ "$DATA_DIR" != /* ]]; then
+  echo "NOCAP_DATA_DIR must be an absolute path: $DATA_DIR" >&2
+  exit 2
+fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then
   RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-  OUTPUT_DIR="runs/manual-${RUN_TIMESTAMP}/${MODE}-seed-${SEED}"
+  OUTPUT_ROOT="${NOCAP_OUTPUT_ROOT:-/workspace/nocap-results}"
+  OUTPUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_ID}-${RUN_TIMESTAMP}/proxy-seed-${SEED}"
 fi
 
-RUN_NAME="${MODE}-seed-${SEED}"
+RUN_NAME="${EXPERIMENT_ID}-${EXPERIMENT_SLUG}-proxy-seed-${SEED}"
 WANDB_ARGS=()
 if [[ "${WANDB_ENABLED:-1}" == "1" ]]; then
   WANDB_ARGS+=(
     --log_wandb
     --wandb_project "${WANDB_PROJECT:-nocap-baseline}"
+    --wandb_group "${WANDB_GROUP:-${EXPERIMENT_ID}}"
+    --wandb_checkpoint_artifact
   )
-  if [[ -n "${WANDB_GROUP:-}" ]]; then
-    WANDB_ARGS+=(--wandb_group "$WANDB_GROUP")
-  fi
 fi
 
 mkdir -p "$OUTPUT_DIR"
-echo "mode=$MODE seed=$SEED output_dir=$OUTPUT_DIR"
+exec > >(tee -a "$OUTPUT_DIR/stdout.log") 2>&1
+echo "experiment=$EXPERIMENT_ID mode=$MODE seed=$SEED"
+echo "data_dir=$DATA_DIR"
+echo "output_dir=$OUTPUT_DIR"
 
 torchrun --standalone --nproc_per_node=1 train_gpt2.py \
-  --input_bin "data/fineweb10B/fineweb_train_*.bin" \
-  --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
+  --input_bin "$DATA_DIR/fineweb_train_*.bin" \
+  --input_val_bin "$DATA_DIR/fineweb_val_*.bin" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$RUN_NAME" \
   --run_mode "$MODE" \
   --seed "$SEED" \
   --model d12 \
   --batch_size 16 \
-  --grad_accumulation_steps 32 \
+  --grad_accumulation_steps 16 \
+  --batch_ramp_start_accumulation_steps 1 \
+  --batch_ramp_fraction 0.5 \
   --sequence_length 1024 \
-  --val_loss_every 128 \
+  --val_loss_every "$VAL_LOSS_EVERY" \
   --val_batch_size 16 \
   --num_iterations "$NUM_ITERATIONS" \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
+  --lr_reference_batch_tokens 524288 \
   --warmup_iters "$WARMUP_ITERS" \
   --warmdown_iters "$WARMDOWN_ITERS" \
   --save_every "$SAVE_EVERY" \
+  --abort_on_nonfinite \
   "${WANDB_ARGS[@]}" \
   "$@"
