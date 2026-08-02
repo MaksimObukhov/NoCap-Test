@@ -274,15 +274,48 @@ def preflight_launch_check(manifest, experiments, worktrees, options, ledger):
             "preflight_launch", experiment=experiment["id"], exit_code=code
         )
         if code != 0:
-            tail = ""
-            if os.path.exists(log_path):
-                with open(log_path) as handle:
-                    tail = "".join(handle.readlines()[-15:])
             raise InfrastructureFailure(
-                f"{experiment['id']} cannot start its proxy stage (exit {code}). "
-                f"Last output:\n{tail}"
+                f"{experiment['id']} cannot start its proxy stage (exit {code}).\n"
+                f"{_useful_failure_output(log_path)}\n"
+                f"Full log: {log_path}"
             )
     return checked
+
+
+# torchrun prints a ~15 line failure banner that carries no diagnostic value
+# and buries the child's actual error above it. Reporting a fixed-size tail
+# showed the banner and nothing else.
+_TORCHRUN_NOISE = (
+    "=====",
+    "-----",
+    "Root Cause",
+    "Failures:",
+    "<NO_OTHER_FAILURES>",
+    "train_gpt2.py FAILED",
+    "time      :",
+    "host      :",
+    "rank      :",
+    "exitcode  :",
+    "error_file:",
+    "traceback : To enable",
+    "[0]:",
+)
+
+
+def _useful_failure_output(log_path, limit=40):
+    """Extract the child's real error, skipping torchrun's failure banner."""
+    if not os.path.exists(log_path):
+        return "(no log was written)"
+    with open(log_path) as handle:
+        lines = [line.rstrip("\n") for line in handle]
+    signal = [
+        line
+        for line in lines
+        if line.strip() and not any(line.lstrip().startswith(n) for n in _TORCHRUN_NOISE)
+    ]
+    if not signal:
+        signal = lines
+    return "\n".join(signal[-limit:])
 
 
 # ---------------------------------------------------------------------------

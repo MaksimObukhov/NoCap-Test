@@ -43,9 +43,18 @@ def existing_worktrees(repo):
     return trees
 
 
-def prepare(repo, manifest_path, worktree_root, base_worktree):
+def prepare(repo, manifest_path, worktree_root, base_worktree, fetch=True):
     with open(manifest_path) as handle:
         manifest = json.load(handle)
+
+    if fetch:
+        # Pulling only the control branch leaves every origin/expNNN ref at
+        # whatever it was, so worktrees get pinned to stale code that no
+        # longer matches the manifest. That is not hypothetical: it shipped a
+        # worktree without --preflight_only and the launch check died on an
+        # unrecognised argument.
+        print("fetching origin ...")
+        git(["fetch", "origin", "--prune"], cwd=repo)
 
     os.makedirs(worktree_root, exist_ok=True)
     prepared = {}
@@ -98,6 +107,11 @@ def main():
     parser.add_argument("--worktree-root", required=True)
     parser.add_argument("--base-worktree", required=True)
     parser.add_argument("--output", default="")
+    parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="skip git fetch; only for offline reruns of an already-synced repo",
+    )
     arguments = parser.parse_args()
 
     prepared = prepare(
@@ -105,6 +119,7 @@ def main():
         arguments.manifest,
         arguments.worktree_root,
         arguments.base_worktree,
+        fetch=not arguments.no_fetch,
     )
     if arguments.output:
         os.makedirs(os.path.dirname(os.path.abspath(arguments.output)), exist_ok=True)
