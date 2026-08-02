@@ -557,6 +557,17 @@ if __name__ == "__main__":
         default=0.0,
         help="global gradient-norm clip threshold; 0 disables clipping",
     )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="wsd",
+        choices=["wsd", "cosine"],
+        help=(
+            "exp020: post-warmup schedule shape. wsd is the baseline "
+            "trapezoid; cosine decays to zero over the remaining budget and "
+            "ignores --warmdown_iters"
+        ),
+    )
     # gradient health instrumentation and tripwires
     parser.add_argument(
         "--abort_on_nonfinite",
@@ -660,6 +671,13 @@ if __name__ == "__main__":
     assert args.milestone_every >= 0
     assert args.mlp_ratio > 0.0
     assert args.grad_clip >= 0.0
+    if args.lr_schedule == "cosine":
+        # Cosine decays over the whole post-warmup budget, so a warmdown
+        # window is meaningless. Require it to be zero rather than silently
+        # ignoring a value someone believed was in effect.
+        assert args.warmdown_iters == 0, (
+            "--lr_schedule cosine ignores --warmdown_iters; pass 0 explicitly"
+        )
     # A proxy or full result is only reconstructible if its final weights
     # survive. The v2 suite passed this flag to every stage, which is why no
     # exp012-exp014 final checkpoint exists.
@@ -981,11 +999,25 @@ if __name__ == "__main__":
         return math.floor(accumulation + 0.5)
 
     def base_lr_at(current_tokens, update_tokens):
+        """Token-indexed learning rate.
+
+        exp020 adds the `cosine` shape alongside the baseline trapezoid WSD.
+        Warmup is byte-identical between the two, so only the post-warmup
+        shape differs, and both reach exactly zero at the token budget, so
+        neither gets a terminal-LR advantage. Definition fixed in
+        EXPERIMENTS.md before implementation: no minimum-LR floor, no
+        restarts, no separate decay horizon.
+        """
         if current_tokens < warmup_tokens:
             return args.learning_rate * min(
                 (current_tokens + update_tokens) / warmup_tokens,
                 1.0,
             )
+        if args.lr_schedule == "cosine":
+            span = target_tokens - warmup_tokens
+            progress = (current_tokens - warmup_tokens) / span if span > 0 else 1.0
+            progress = min(max(progress, 0.0), 1.0)
+            return args.learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
         if current_tokens < target_tokens - warmdown_tokens:
             return args.learning_rate
         return args.learning_rate * (
