@@ -2,6 +2,7 @@
 """exp016-A: frozen-weight causal replay of the descent-budgeted direction."""
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -29,6 +30,22 @@ EXPECTED_ARGS = {
     "grad_accumulation_steps": 32,
     "seed": 0,
 }
+CAPTURED_SOURCE_SHA256 = (
+    "61f4afe121c6ee1eb077b0356234cad6d031d7d95ae8ab79f18fcc678cb81cbd"
+)
+EXPECTED_CHECKPOINTS = {
+    "proxy": {
+        "sha256": "bb909dfe3d3b99258e1d550a62de098877075887551b2dd14695eb55b98034a8",
+        "next_step": 1788,
+        "tokens_seen": 937426944,
+    },
+    "full": {
+        "sha256": "893db0f1dfbb582f0a33da598b0e92de0e56bcac3322a002140c6839d3010b4b",
+        "next_step": 4768,
+        "tokens_seen": 2499805184,
+    },
+}
+TOKENS_PER_LEGACY_UPDATE = 524288
 
 
 def parse_checkpoint_spec(spec):
@@ -37,8 +54,27 @@ def parse_checkpoint_spec(spec):
     return tuple(spec.split("=", 1))
 
 
-def validate_checkpoint(checkpoint, label, expected_commit):
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_checkpoint(
+    checkpoint,
+    label,
+    expected_commit,
+    checkpoint_sha256,
+    captured_source_sha256,
+):
     errors = []
+    expected_checkpoint = EXPECTED_CHECKPOINTS[label]
+    if checkpoint_sha256 != expected_checkpoint["sha256"]:
+        errors.append(f"unexpected checkpoint SHA-256: {checkpoint_sha256}")
+    if captured_source_sha256 != CAPTURED_SOURCE_SHA256:
+        errors.append(f"unexpected captured-source SHA-256: {captured_source_sha256}")
     checkpoint_args = checkpoint.get("args", {})
     for key, expected in EXPECTED_ARGS.items():
         if checkpoint_args.get(key) != expected:
@@ -51,6 +87,19 @@ def validate_checkpoint(checkpoint, label, expected_commit):
     for key in ("model", "optimizer", "next_x", "next_y", "train_loader"):
         if key not in checkpoint:
             errors.append(f"missing checkpoint key: {key}")
+    next_step = checkpoint.get("next_step")
+    if next_step != expected_checkpoint["next_step"]:
+        errors.append(
+            f"next_step: expected {expected_checkpoint['next_step']}, got {next_step}"
+        )
+    stored_tokens = checkpoint.get("tokens_seen")
+    derived_tokens = next_step * TOKENS_PER_LEGACY_UPDATE if next_step is not None else None
+    effective_tokens = stored_tokens if stored_tokens is not None else derived_tokens
+    if effective_tokens != expected_checkpoint["tokens_seen"]:
+        errors.append(
+            "tokens_seen: expected "
+            f"{expected_checkpoint['tokens_seen']}, got {effective_tokens}"
+        )
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -151,8 +200,19 @@ def analyze_checkpoint(
     expected_commit,
 ):
     started = time.perf_counter()
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    captured_source_path = Path(checkpoint_path).with_name("train_gpt2.py")
+    if not captured_source_path.is_file():
+        raise ValueError(f"missing captured source beside checkpoint: {captured_source_path}")
+    captured_source_sha256 = sha256_file(captured_source_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    validate_checkpoint(checkpoint, label, expected_commit)
+    validate_checkpoint(
+        checkpoint,
+        label,
+        expected_commit,
+        checkpoint_sha256,
+        captured_source_sha256,
+    )
     model = GPT(GPTConfig()).train().cuda()
     model.load_state_dict(checkpoint["model"])
     optimizer = model.configure_optimizers(
@@ -257,6 +317,15 @@ def analyze_checkpoint(
         "label": label,
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
         "checkpoint_next_step": checkpoint["next_step"],
+        "checkpoint_tokens_seen": checkpoint.get("tokens_seen"),
+        "effective_tokens_seen": checkpoint.get(
+            "tokens_seen", checkpoint["next_step"] * TOKENS_PER_LEGACY_UPDATE
+        ),
+        "tokens_seen_source": (
+            "stored" if "tokens_seen" in checkpoint else "derived-next-step-times-524288"
+        ),
+        "checkpoint_sha256": checkpoint_sha256,
+        "captured_source_sha256": captured_source_sha256,
         "checkpoint_args": checkpoint["args"],
         "checkpoint_metadata": checkpoint.get("metadata", {}),
         "parameters_unchanged": unchanged,
