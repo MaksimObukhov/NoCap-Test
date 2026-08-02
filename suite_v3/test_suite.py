@@ -14,7 +14,9 @@ and would have failed against that code.
 import ast
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 
 from suite_v3 import gates, suite
@@ -642,7 +644,37 @@ class ManifestArithmetic(unittest.TestCase):
             self.assertAlmostEqual(final_limit - reference, 0.25, places=5)
 
 
+class FailingWandb(types.ModuleType):
+    """Stand-in for wandb that always fails on init.
+
+    Without this the test reaches the real wandb. On a logged-in host that
+    creates an actual run in a project literally named "p"; the first version
+    of this test did exactly that on the GPU instance and left an offline run
+    directory behind. Tests must not touch the network or the operator's
+    W&B account.
+    """
+
+    def __init__(self):
+        super().__init__("wandb")
+        self.init_calls = 0
+
+    def init(self, **kwargs):
+        self.init_calls += 1
+        raise RuntimeError("simulated W&B outage")
+
+
 class UploadRetry(unittest.TestCase):
+    def setUp(self):
+        self.fake_wandb = FailingWandb()
+        self.saved = sys.modules.get("wandb")
+        sys.modules["wandb"] = self.fake_wandb
+
+    def tearDown(self):
+        if self.saved is None:
+            sys.modules.pop("wandb", None)
+        else:
+            sys.modules["wandb"] = self.saved
+
     def test_failed_upload_reports_without_touching_training(self):
         """An upload failure must never mean recomputing a proxy."""
         from suite_v3 import upload
@@ -654,6 +686,7 @@ class UploadRetry(unittest.TestCase):
             receipt = upload.upload_stage(
                 project="p", group="g", run_name="r", stage_dir=stage_dir
             )
+            self.assertEqual(self.fake_wandb.init_calls, upload.MAX_ATTEMPTS)
             self.assertEqual(receipt["status"], "failed")
             self.assertEqual(len(receipt["attempts"]), upload.MAX_ATTEMPTS)
             self.assertIn("no training needs to be repeated", receipt["note"])
