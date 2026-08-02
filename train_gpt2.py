@@ -210,11 +210,56 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas
+    def configure_optimizers(
+        self,
+        weight_decay,
+        learning_rate,
+        betas,
+        device_type,
+        no_wd_tied_embedding=False,
+    ):
+        """Build AdamW, optionally exempting the tied embedding from decay.
+
+        exp017. The baseline passes `self.parameters()` with a single decay
+        value, so the tied `wte`/`lm_head` matrix -- 50257 x 768 = 38,597,376
+        parameters, 35.3% of the 3D stack -- is decayed at the same rate as
+        the transformer blocks. This is a regularization choice under test,
+        not a bug fix: blanket decay is a defensible default and the claim
+        being tested is only that this model at this scale does better
+        without it on that one matrix.
+
+        Because the weight is tied, `self.parameters()` yields the shared
+        tensor exactly once, and identity comparison is what separates it
+        from everything else. Falling back to a shape or name match would
+        silently pick up any other tensor of the same shape.
+        """
+        if not no_wd_tied_embedding:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                betas=betas,
+            )
+            return optimizer
+
+        tied = self.lm_head.weight
+        assert self.transformer.wte.weight is tied, (
+            "no_wd_tied_embedding assumes wte and lm_head share one tensor"
         )
-        return optimizer
+        decay, no_decay = [], []
+        for parameter in self.parameters():
+            (no_decay if parameter is tied else decay).append(parameter)
+        assert len(no_decay) == 1, (
+            f"expected exactly one undecayed tensor, found {len(no_decay)}"
+        )
+        return torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=betas,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -556,6 +601,14 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="global gradient-norm clip threshold; 0 disables clipping",
+    )
+    parser.add_argument(
+        "--no_wd_tied_embedding",
+        action="store_true",
+        help=(
+            "exp017: exempt the tied wte/lm_head matrix from weight decay "
+            "while retaining --weight_decay everywhere else"
+        ),
     )
     # gradient health instrumentation and tripwires
     parser.add_argument(
@@ -933,6 +986,16 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         betas=(0.9, 0.95),
         device_type=device,
+        no_wd_tied_embedding=args.no_wd_tied_embedding,
+    )
+    print0(
+        "optimizer groups: "
+        + ", ".join(
+            f"[{index}] wd={group['weight_decay']} "
+            f"tensors={len(group['params'])} "
+            f"params={sum(p.numel() for p in group['params']):,}"
+            for index, group in enumerate(optimizer.param_groups)
+        )
     )
 
     completed_steps = 0
