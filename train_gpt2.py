@@ -16,6 +16,10 @@ from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
+from descent_budgeted_adamw import (
+    AttentionVDescentBudgetedCap,
+    aggregate_diagnostics,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -581,6 +585,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--descent_budgeted_attn_v",
+        action="store_true",
+        help="apply exp016 descent-budgeted reweighting to attention-V updates",
+    )
+    parser.add_argument("--spectral_bootstrap_iters", type=int, default=4)
+    parser.add_argument("--spectral_tracking_iters", type=int, default=1)
+    parser.add_argument(
         "--milestone_every",
         type=int,
         default=0,
@@ -660,6 +671,8 @@ if __name__ == "__main__":
     assert args.milestone_every >= 0
     assert args.mlp_ratio > 0.0
     assert args.grad_clip >= 0.0
+    assert args.spectral_bootstrap_iters > 0
+    assert args.spectral_tracking_iters > 0
     # A proxy or full result is only reconstructible if its final weights
     # survive. The v2 suite passed this flag to every stage, which is why no
     # exp012-exp014 final checkpoint exists.
@@ -742,6 +755,9 @@ if __name__ == "__main__":
             "weight_decay",
             "mlp_ratio",
             "grad_clip",
+            "descent_budgeted_attn_v",
+            "spectral_bootstrap_iters",
+            "spectral_tracking_iters",
         )
         for key in resume_keys:
             if key in {
@@ -794,6 +810,14 @@ if __name__ == "__main__":
         )
         with open(os.path.join(args.output_dir, "train_gpt2.py"), "w") as f:
             f.write(code)
+        if args.descent_budgeted_attn_v:
+            # The treatment lives in a second module, so the single-file
+            # source snapshot is not sufficient provenance on its own.
+            with open("descent_budgeted_adamw.py") as source:
+                with open(
+                    os.path.join(args.output_dir, "descent_budgeted_adamw.py"), "w"
+                ) as target:
+                    target.write(source.read())
         if resume_checkpoint is None:
             with open(metrics_path, "w"):
                 pass
@@ -968,6 +992,16 @@ if __name__ == "__main__":
         )
     else:
         x, y = train_loader.next_batch()
+
+    spectral_treatment = None
+    spectral_last_record = None
+    if args.descent_budgeted_attn_v:
+        spectral_treatment = AttentionVDescentBudgetedCap(
+            base_model,
+            optimizer,
+            bootstrap_iterations=args.spectral_bootstrap_iters,
+            tracking_iterations=args.spectral_tracking_iters,
+        )
 
     def accumulation_steps_at(current_tokens):
         if ramp_start_accumulation == args.grad_accumulation_steps:
@@ -1290,7 +1324,13 @@ if __name__ == "__main__":
             grad_norm_finite = True
             clip_activated = False
             clip_coefficient = 1.0
+        spectral_record = {}
+        if spectral_treatment is not None:
+            spectral_record = aggregate_diagnostics(spectral_treatment.prepare())
         optimizer.step()
+        if spectral_treatment is not None:
+            spectral_treatment.apply()
+            spectral_last_record = {"step": completed_steps + 1, **spectral_record}
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         step_time_ms = 1000 * (time.perf_counter() - train_step_start)
@@ -1325,6 +1365,7 @@ if __name__ == "__main__":
             "grad_clip_threshold": args.grad_clip,
             "grad_clip_activated": clip_activated,
             "grad_clip_coefficient": clip_coefficient,
+            **spectral_record,
         }
         if pre_clip_grad_norm is not None:
             phase_grad_norms.setdefault(phase, []).append(pre_clip_grad_norm)
@@ -1395,6 +1436,8 @@ if __name__ == "__main__":
         "mlp_hidden_width": mlp_hidden_width(model_config),
         "grad_clip_threshold": args.grad_clip,
         "gradient_health_by_phase": gradient_health_by_phase(),
+        "descent_budgeted_attn_v": args.descent_budgeted_attn_v,
+        "spectral_last_record": spectral_last_record,
     }
     print0(f"peak memory consumption: {peak_memory_mib} MiB")
     for phase_name, stats in summary["gradient_health_by_phase"].items():
