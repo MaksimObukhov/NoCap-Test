@@ -12,6 +12,10 @@ if [[ "$MODE" != "proxy" ]]; then
   echo "exp021 intentionally exposes only the preregistered proxy stage" >&2
   exit 2
 fi
+if [[ "$SEED" != "0" ]]; then
+  echo "exp021 currently authorises proxy seed 0 only" >&2
+  exit 2
+fi
 
 if [[ $# -ge 3 ]]; then
   shift 3
