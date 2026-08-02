@@ -104,15 +104,17 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # exp021 keeps the measured exp007/exp012 uniform 3D architecture.
-        self.c_fc = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
+        # Equal-leading-FLOP/parameter 2D SwiGLU. One fused gate/value
+        # projection avoids the extra kernel launches measured in exp015.
+        hidden_width = 2 * config.n_embd
+        self.c_gate_value = nn.Linear(
+            config.n_embd, 2 * hidden_width, bias=False
+        )
+        self.c_proj = nn.Linear(hidden_width, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.gelu(x)
-        x = self.c_proj(x)
-        return x
+        gate, value = self.c_gate_value(x).chunk(2, dim=-1)
+        return self.c_proj(F.silu(gate) * value)
 
 
 class Block(nn.Module):
@@ -189,8 +191,26 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        tied_weight = self.transformer.wte.weight
+        unique_parameters = list(self.parameters())
+        decay_parameters = [
+            parameter for parameter in unique_parameters if parameter is not tied_weight
+        ]
+        assert sum(parameter is tied_weight for parameter in unique_parameters) == 1
+        assert len({id(parameter) for parameter in decay_parameters}) == len(
+            decay_parameters
+        )
+        assert sum(parameter.numel() for parameter in unique_parameters) == (
+            tied_weight.numel()
+            + sum(parameter.numel() for parameter in decay_parameters)
+        )
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas
+            [
+                {"params": decay_parameters, "weight_decay": weight_decay},
+                {"params": [tied_weight], "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=betas,
         )
         return optimizer
 
@@ -430,6 +450,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=0.0,
+        help="global gradient-norm clip; 0 only measures the norm",
+    )
+    parser.add_argument(
         "--abort_on_nonfinite",
         action="store_true",
         help="abort if train/validation loss or global gradient norm is non-finite",
@@ -449,6 +475,18 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="save latest.pt every N final-batch-equivalent updates; 0 disables",
+    )
+    parser.add_argument(
+        "--milestone_start_iter",
+        type=int,
+        default=0,
+        help="first final-batch-equivalent update eligible for immutable milestones",
+    )
+    parser.add_argument(
+        "--milestone_every",
+        type=int,
+        default=0,
+        help="immutable milestone interval in final-batch-equivalent updates",
     )
     parser.add_argument(
         "--profile",
@@ -502,7 +540,11 @@ if __name__ == "__main__":
             <= args.grad_accumulation_steps
         ), "batch ramp must grow toward --grad_accumulation_steps"
     assert args.lr_reference_batch_tokens >= 0
+    assert args.grad_clip >= 0.0
     assert args.save_every >= 0
+    assert args.milestone_start_iter >= 0
+    assert args.milestone_every >= 0
+    assert (args.milestone_start_iter == 0) == (args.milestone_every == 0)
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
     assert args.profile_active_steps > 0
@@ -565,6 +607,9 @@ if __name__ == "__main__":
             "warmup_iters",
             "warmdown_iters",
             "weight_decay",
+            "grad_clip",
+            "milestone_start_iter",
+            "milestone_every",
         )
         for key in resume_keys:
             checkpoint_value = resume_checkpoint["args"].get(key, 0)
@@ -660,6 +705,8 @@ if __name__ == "__main__":
     warmdown_tokens = args.warmdown_iters * final_tokens_per_update
     validation_interval_tokens = args.val_loss_every * final_tokens_per_update
     save_interval_tokens = args.save_every * final_tokens_per_update
+    milestone_start_tokens = args.milestone_start_iter * final_tokens_per_update
+    milestone_interval_tokens = args.milestone_every * final_tokens_per_update
     ramp_start_accumulation = (
         args.batch_ramp_start_accumulation_steps
         or args.grad_accumulation_steps
@@ -786,6 +833,13 @@ if __name__ == "__main__":
             return None
         if kind == "latest":
             destination = latest_checkpoint_path
+        elif kind == "milestone":
+            destination = os.path.join(
+                checkpoint_dir, f"milestone-tokens{tokens_seen:012d}.pt"
+            )
+            if os.path.exists(destination):
+                print0(f"milestone already exists, not rewriting: {destination}")
+                return destination
         elif kind == "final":
             destination = final_checkpoint_path
         else:
@@ -950,9 +1004,15 @@ if __name__ == "__main__":
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()
+        clip_limit = args.grad_clip if args.grad_clip > 0 else float("inf")
         pre_clip_grad_norm = torch.nn.utils.clip_grad_norm_(
-            base_model.parameters(), float("inf"), error_if_nonfinite=False
+            base_model.parameters(), clip_limit, error_if_nonfinite=False
         ).item()
+        clip_coefficient = (
+            min(1.0, args.grad_clip / (pre_clip_grad_norm + 1e-6))
+            if args.grad_clip > 0
+            else 1.0
+        )
         if args.abort_on_nonfinite and not (
             math.isfinite(lossf) and math.isfinite(pre_clip_grad_norm)
         ):
@@ -1003,6 +1063,8 @@ if __name__ == "__main__":
             "effective_batch_tokens": update_tokens,
             "phase": phase,
             "pre_clip_grad_norm": pre_clip_grad_norm,
+            "clip_coefficient": clip_coefficient,
+            "clip_activated": clip_coefficient < 1.0,
             "step_time_ms": step_time_ms,
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
@@ -1025,6 +1087,20 @@ if __name__ == "__main__":
         )
         if crossed_save_boundary:
             save_checkpoint(completed_steps, kind="latest")
+
+        crossed_milestone_boundary = False
+        if args.milestone_every > 0 and tokens_seen >= milestone_start_tokens:
+            if previous_tokens_seen < milestone_start_tokens:
+                crossed_milestone_boundary = True
+            else:
+                crossed_milestone_boundary = (
+                    (tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                    > (previous_tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                )
+        if crossed_milestone_boundary:
+            save_checkpoint(completed_steps, kind="milestone")
 
         if profiler is not None:
             # One profiler step is one complete optimizer update, including accumulation.
@@ -1063,7 +1139,10 @@ if __name__ == "__main__":
         "tokens_per_second": tokens_seen / training_time_seconds,
         "peak_memory_mib": peak_memory_mib,
         "parameter_count": sum(p.numel() for p in base_model.parameters()),
-        "mlp_ratio": 3.0,
+        "mlp_kind": "fused-2d-swiglu",
+        "gradient_clip": args.grad_clip,
+        "tied_weight_decay": 0.0,
+        "other_weight_decay": args.weight_decay,
         "lr_reference_batch_tokens": lr_reference_batch_tokens,
         "gradient_health_by_phase": gradient_health_by_phase,
     }
@@ -1095,6 +1174,12 @@ if __name__ == "__main__":
             "next_step": completed_steps,
             "tokens_seen": tokens_seen,
         }
+        summary["milestone_checkpoints"] = [
+            {"path": path, "bytes": os.path.getsize(path)}
+            for path in sorted(
+                glob.glob(os.path.join(checkpoint_dir, "milestone-tokens*.pt"))
+            )
+        ]
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
