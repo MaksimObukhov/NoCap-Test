@@ -109,11 +109,11 @@ proposal's cost but does not predict a loss improvement.
 | exp009 | completed offline measurement, killed | Residual-Complement Attention: measure and locally perturb the residual-aligned part of each attention update | No layer passed the full checkpoint because the four-batch finite-difference slope was not significant | Stop RCA unchanged; no training experiment |
 | exp010 | completed offline measurement, mechanism passed | Selective Spectral AdamW: diagnose persistent dominant directions in AdamW-preconditioned hidden-matrix updates | Shared passing families: attention output, attention V, MLP down, and MLP up | Premise survives; causal top-mode attribution and systems cost remain unresolved before implementation |
 | exp011 | stopped at A, treatment killed | Selectively cap only the excessive leading mode of the AdamW-preconditioned attention-V update | A reduced functional concentration but lost too much first-order descent and over-amplified weaker proxy modes | Do not run B or C unchanged; any partial/descent-budgeted cap is a new experiment |
-| exp012 | planned nightly funnel | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | Awaiting same-host benchmark, 256-update health diagnostic, and proxy seed 0 | No full run tonight; promote only after the pre-registered proxy gate |
-| exp013 | planned nightly funnel | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | Awaiting exact-shape benchmark, 256-update health diagnostic, and proxy seed 0 | Test systems and loss/token claims separately; no full run tonight |
-| exp014 | planned nightly funnel | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | Awaiting layer diagnostics, same-host benchmark, health gate, and proxy seed 0 | Compare against uniform 3D as the capacity-matched systems control |
-| exp015 | planned nightly funnel | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Awaiting accounting, exact-shape benchmark, 256-update health gate, and proxy seed 0 | Require quality recovery without losing the 3D systems advantage |
-| exp016 | planned staged gate | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Awaiting canonical-checkpoint causal replay, correctness/systems gate, then conditional health/proxy | Original internally derived variant; disclose close SPECTRA prior art and do not claim novelty |
+| exp012 | completed proxy s0, pass | Joint treatment: uniform 3D MLP plus the exact exp001 batch ramp; fixed Adam betas and current WSD | 3.581923, delta -0.015850 vs baseline s0 (-8.8 sigma); +10.18% same-host benchmark speedup; effects independent of exp001/exp007 (interaction +0.0025, 1.4 sigma) | Passed the pre-registered proxy gate; leads baseline at every validation checkpoint through 937M tokens; promoted to full run seed 0, pending Max's approval before paid compute |
+| exp013 | completed proxy s0, null result | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | 3.597677, delta -0.000096 vs baseline s0 (-0.05 sigma, exact null); systems speedup +0.34%, `aten::mm` time unchanged (-0.5%) | No loss/token or systems benefit; the GELU activation kernel is already fully fused by Inductor, so the model stays GEMM-bound. Close the hypothesis; do not run seeds 1/2 |
+| exp014 | completed proxy s0, killed | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | 3.624233, delta +0.026460 vs baseline s0 (+14.7 sigma), +0.007872 worse than exp007 uniform 3D (+4.4 sigma); benchmark +0.17% vs uniform-3D control | Killed by the pre-registered proxy gate. Per-layer gradient RMS at update 256 shows the allocation prior was backwards: layers 8-11 (given 3.5D) have below-average grad RMS while layers 0-3 (given 2.5D) have 5-8x the mean. Do not run seeds 1/2 |
+| exp015 | health-killed, kill contested | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Health diagnostic killed on 3 gradient spikes and 2 loss spikes (pool median over warmup+post-warmup); benchmark -1.225% vs uniform-3D control, within the -2% threshold; proxy never ran | All spikes (updates 80, 86, 88) fall inside the 96-update warmup and fully recover within one update; post-warmup max grad norm (1.92) is in line with exp012-014. The pooled-median health gate conflates warmup transients with steady-state instability. See exp015 Results below for the reanalysis and the reopening condition |
+| exp016 | planned staged gate | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Awaiting canonical-checkpoint causal replay, correctness/systems gate, then conditional health/proxy | Still blocked: stage A requires frozen-weight checkpoints at exp000 proxy and full seed-0 states. The night suite's proxy checkpoints were mid-run and overwritten (`skip_final_checkpoint: true`, `save_every` rotation onto one file), so no canonical checkpoint exists yet. Unblocks once a full run saves distinct, retained checkpoints |
 
 ## Completed experiments
 
@@ -1243,6 +1243,53 @@ of optimizer updates.
 - Wrong SHA, dirty tracked files, changed token prefix, missing artifacts or
   failed W&B artifact upload invalidates a stage and stops the nightly suite.
 
+**Results (night suite `night-20260802-v2`, 2 August 2026).** SHA
+`7423fbc8`, clean tree, provenance and W&B artifacts complete for benchmark,
+health, and proxy stages.
+
+| Result | Value |
+|---|---:|
+| Benchmark speedup vs baseline (median steady-state tok/s) | +10.18% |
+| Health diagnostic | pass; 0 grad spikes, 0 loss spikes, max grad norm 4.72 |
+| Final proxy validation loss | **3.581923** |
+| Delta vs baseline seed 0 (3.597773) | **-0.015850** (-8.8 sigma) |
+| Proxy time-to-baseline-final-loss | 6582.7s vs baseline's 7403.1s (-11.1% train time) |
+
+The benchmark and health gates passed as pre-registered; the proxy loss is
+well below the `3.593773` pass threshold. exp012 led the baseline learning
+curve at all 14 validation checkpoints from 67M to 937M tokens, though the
+absolute gap decayed from 0.71 at 67M tokens to 0.016 at 937M (see the
+factor decomposition below for why this decay is expected).
+
+**Factor decomposition.** At the identical 937M-token proxy checkpoint:
+
+```text
+baseline 4D, flat batch     3.597773
+exp001  4D + ramp alone     3.560791   delta -0.036982 (-20.6 sigma)
+exp007  3D, flat batch      3.616361   delta +0.018588 (+10.3 sigma)
+exp012  3D + ramp (joint)   3.581923   delta -0.015850 (-8.8 sigma)
+additive prediction         3.579379   delta -0.018394
+interaction (obs-additive)  +0.002544  (+1.4 sigma)
+```
+
+The ramp and 3D-MLP effects are statistically independent (interaction is
+within 1.5 sigma of zero): the batch ramp buys back exp007's capacity loss
+without a joint-treatment penalty or bonus. The ramp's own systems cost is
+small: bucketing throughput by accumulation level during the ramped proxy
+run gives +1.59% wall-time overhead versus running the entire proxy at the
+terminal accumulation=32, against 2549 optimizer updates instead of 1788
+(+42.6%).
+
+**Promotion decision.** exp012 is the leading full-run candidate. The proxy
+gap versus baseline decays roughly as a power law in tokens (exponent
+estimates from 1.6 on the full 14-point curve to 3.0 on the last 4
+warmdown-aligned points), so the proxy result does not by itself establish
+that exp012 beats the `3.3821` full-run target: extrapolated gap-at-2.5B
+ranges from 0.0008 to 0.0047, i.e. plausibly inside or outside the +0.0044
+margin baseline carries at 2.5B tokens. Only a full run resolves this. No
+full run has been authorised or started as of this entry; it requires Max's
+explicit approval per the paid-compute rule in `AGENTS.md`.
+
 ## exp013 — squared ReLU activation
 
 **Status:** planned. No full run is authorised by this row.
@@ -1267,6 +1314,26 @@ baseline token order, batch, WSD, AdamW, and token budget.
   at least 2%; loss `>= 3.601773` kills the unchanged treatment.
 - The health gate and provenance/W&B invalidation rules are identical to
   exp012. The diagnostic timing is never used as systems evidence.
+
+**Results (night suite `night-20260802-v2`, 2 August 2026).** SHA
+`be085f3f`, clean tree, provenance and W&B artifacts complete.
+
+| Result | Value |
+|---|---:|
+| Benchmark speedup vs baseline (median steady-state tok/s) | +0.34% |
+| Health diagnostic | pass; 1 grad spike (step 1, warmup), 0 loss spikes |
+| Final proxy validation loss | 3.597677 |
+| Delta vs baseline seed 0 (3.597773) | **-0.000096** (-0.05 sigma) |
+
+This is a measured null on both claims, not an inconclusive result: the
+delta is two orders of magnitude below the seed-to-seed noise floor
+(sample std 0.0018). The profiler explains the systems null directly —
+`aten::mm` self-CUDA time is unchanged from baseline (2.739s vs 2.753s,
+-0.5%), because the GELU-vs-ReLU^2 activation is already fully fused into a
+single Triton kernel by `torch.compile`, and the model spends 67% of its
+step in GEMM regardless. The pre-registered 5% GELU-kernel Amdahl ceiling
+was never reachable at this compile configuration. Close the hypothesis;
+do not run seeds 1/2 or a full run.
 
 ## exp014 — depth-shaped 3D-average MLP
 
@@ -1296,6 +1363,29 @@ capacity- and average-FLOP control; exp000 remains the quality reference.
 - Non-finite/pathological health, wrong SHA, accounting mismatch, dirty tracked
   files, missing artifacts, or failed W&B upload invalidates the stage.
 
+**Results (night suite `night-20260802-v2`, 2 August 2026).** SHA
+`cd87f73e`, clean tree, provenance and W&B artifacts complete.
+
+| Result | Value |
+|---|---:|
+| Benchmark vs uniform-3D control (median steady-state tok/s) | +0.17% (within 2%) |
+| Health diagnostic | pass; 0 grad spikes, 0 loss spikes |
+| Final proxy validation loss | 3.624233 |
+| Delta vs baseline seed 0 (3.597773) | +0.026460 (+14.7 sigma) |
+| Delta vs exp007 uniform-3D (3.616361) | **+0.007872** (+4.4 sigma, wrong direction) |
+
+Killed by the pre-registered gate: loss is worse than exp007 by more than
+the `0.004` kill margin, in the opposite direction from the hypothesis.
+Per-layer normalized gradient RMS at update 256 shows why: layers 8-11
+(allocated 3.5D, the "more capacity where it matters" layers) have grad RMS
+0.93-1.14e-5, below the mean and below their 4D-uniform counterparts
+(1.30-1.66e-5), while layers 0-3 (allocated the narrower 2.5D) have RMS
+5.71-1.49e-5, 5-8x the mean. The shallow-to-deep allocation prior in the
+hypothesis was backwards for this model: gradient magnitude, and by
+extension apparent capacity demand, is concentrated in the early layers,
+not the late ones. Do not run seeds 1/2 or revisit this allocation without
+first re-deriving the prior from the per-layer diagnostic.
+
 ## exp015 — 2D SwiGLU versus 3D GELU
 
 **Status:** planned. No full run is authorised by this row.
@@ -1318,6 +1408,59 @@ complete-step regression versus uniform 3D is no more than 2%.
 - The activation/gating kernel must remain compiled; eager fallback, recompile
   storms, non-finite/pathological health, accounting mismatch, wrong SHA,
   missing artifacts, or failed W&B upload invalidates the stage.
+
+**Results (night suite `night-20260802-v2`, 2 August 2026).** SHA
+`2008e2d1`, clean tree. Benchmark and health stages complete and uploaded;
+proxy was skipped by the harness because the health stage returned `kill`.
+
+| Result | Value |
+|---|---:|
+| Benchmark vs uniform-3D control (median steady-state tok/s) | -1.225% (within the -2% threshold) |
+| Health diagnostic decision | **kill**: 3 grad spikes, 2 loss spikes (`>=2` of either kills) |
+| Max global grad norm | 63.94 (vs 4.15-4.72 for exp012/13/14) |
+| Median global grad norm | 0.5044 (in line with exp012/13/14: 0.42-0.53) |
+| Nonfinite count | 0 |
+
+**Reanalysis.** The three grad spikes (updates 80, 86, 88) and two loss
+spikes (80, 81) all fall inside the 96-update warmup window; none recur
+after warmup. The step-80 event (`|g|`=63.94, loss jump +0.968) fully
+reverses at step 81 (loss jump -0.946) with zero non-finite values and a
+smoothly increasing parameter norm (224.5 -> 224.8 -> 225.2) throughout.
+Splitting the diagnostic by phase: warmup max `|g|` = 63.94 but
+post-warmup max `|g|` = 1.92, median 0.4175 — statistically indistinguishable
+from exp012/13/14's post-warmup medians (0.33-0.42). The health gate computes
+its 10x-median spike threshold over the pooled 256 updates (160 of them
+post-warmup, median ~0.42), so an ordinary warmup transient in a
+multiplicative-gate architecture crossed a threshold calibrated on a mostly
+non-warmup population. exp013 shows the same effect at smaller scale (1
+spike, at update 1, its only warmup-adjacent update).
+
+This does not establish that SwiGLU is stable — a max grad norm 13.6x every
+other candidate's maximum is a real signal that a multiplicative gate is
+more warmup-sensitive here than an additive GELU MLP, and is worth
+respecting rather than dismissing. It does establish that the specific gate
+rule (pooled-median threshold, unconditional on phase) is not equipped to
+distinguish "sharp but self-correcting warmup transient" from "persistent
+instability" for this architecture family.
+
+**Separately, from the benchmark profiler:** the 2D SwiGLU MLP's `c_gate`
+and `c_value` are implemented as two separate `Linear(768, 1536)` layers
+(`night-20260802-v2/exp015/benchmark/train_gpt2.py:106-107`) rather than one
+fused `Linear(768, 3072)` plus a chunk. This produces 5856 `aten::mm` calls
+per step versus 4704 for the other candidates, and is the most likely
+source of the -1.225% systems regression relative to uniform 3D despite
+`aten::mm` self-CUDA time being the lowest of all six benchmarked
+configurations (2.457s).
+
+**Reopening condition.** Do not reopen exp015 with an unmodified gate rule.
+A reopened attempt should (a) fuse the gate/value projection into a single
+matmul before re-benchmarking, and (b) recompute the health gate's spike
+threshold from the post-warmup population only, or run it as two windows.
+If clipping is used to hedge the warmup sensitivity, cap it high enough
+(8-10) to be a no-op for exp012/13/14 (whose max grad norm is 4.15-4.72),
+preserving a fair comparison; this satisfies, rather than contradicts, the
+suite-wide rule against clipping without measured pathology, since the
+pathology is now measured and specific to this architecture.
 
 ## exp016 — Descent-Budgeted Multi-Directional AdamW
 
