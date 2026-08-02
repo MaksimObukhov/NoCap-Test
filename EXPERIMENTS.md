@@ -118,6 +118,7 @@ proposal's cost but does not predict a loss improvement.
 | exp018 | completed forward feasibility measurement, pass | FP8 compute path for the `lm_head` vocab projection | BF16 forward median 10.724 ms vs FP8 cast+GEMM 4.572 ms; forward-only projected full-step gain 5.28% on RTX 4090 | Authorises a separate integration benchmark only after the architecture winner. Backward, tied-weight integration, padded-vocabulary masking and training quality remain unvalidated |
 | exp019 | attempted v3, infrastructure-invalid | Fused 2D SwiGLU (one `Linear(768->3072)` + `chunk(2)`) plus the exact exp012 batch ramp, with gradient clipping at 10 | Accounting passed at 109,376,256 parameters and exact fused/reference equivalence; treatment benchmark failed before training because its validation path remained relative | No systems or proxy result. Retry later with absolute train and validation globs; this remains the next architecture candidate if exp021 does not justify a new combination |
 | exp020 | completed proxy s0, killed | Cosine LR schedule against the baseline trapezoid WSD, unchanged 4D architecture and flat 524,288 batch | 3.676178, delta +0.078405 vs baseline (+43.6 sigma); exact 937,426,944-token budget | Strong negative result for this horizon: close cosine unchanged and do not run seeds 1/2 |
+| exp021 | planned direct proxy s0 | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | Awaiting one 937,426,944-token proxy; no benchmark, smoke or separate health stage | Tests whether more frequent, noisier early updates improve time-to-quality enough to repay additional optimizer-step overhead. The next multi-method suite is conditional on this result |
 
 ## Completed experiments
 
@@ -1834,3 +1835,62 @@ horizon, continuously spending the LR decay across training was much worse at
 the terminal proxy checkpoint than the baseline WSD schedule that reserves a
 concentrated warmdown.
 W&B stage artifact: https://wandb.ai/m-obukhov-home/nocap-baseline/runs/o7u2wfwq
+
+## exp021 — aggressive small-batch ramp on uniform 3D
+
+**Status:** planned for direct proxy seed 0. No full run is authorised by this
+row.
+
+**Question.** exp002 measured a mid-run critical batch near 106k, while exp012
+ramps from 131,072 to 524,288 and spends the second half of the proxy at the
+largest batch. At a fixed token budget, a smaller effective batch performs
+more optimizer updates and injects more gradient noise; it does not make each
+individual update larger. The hypothesis is that these more frequent early
+updates improve loss per token enough to repay their fixed optimizer overhead,
+while the already measured 3D MLP saving keeps total training time competitive.
+
+**Treatment fixed before implementation.** Keep the exp012 uniform 3D GELU
+architecture, AdamW betas `(0.9, 0.95)`, WD 0.1, seed 0, data order, validation,
+token-indexed WSD shape and exact `937,426,944`-token proxy budget. A microbatch
+contains `16 * 1024 = 16,384` tokens. Over the first 50% of training tokens,
+linearly interpolate gradient accumulation from 1 to 16 and round to the
+nearest integer; after that use 16. Effective batch therefore moves in
+fine-grained discrete steps from 16,384 to 262,144 tokens and never reaches
+524,288.
+
+The LR reference remains fixed at 524,288 tokens, rather than changing with the
+new maximum batch:
+
+```text
+lr(t) = wsd_base_lr(t) * sqrt(effective_batch_tokens(t) / 524288)
+```
+
+Thus the maximum batch uses peak LR `0.0018 * sqrt(1/2) = 0.001272792`; the
+smallest batch uses `0.0018 * sqrt(1/32) = 0.000318198`, before the token-indexed
+warmup multiplier. Warmup and warmdown retain exp012's exact token spans:
+50,331,648 and 201,326,592 tokens. Expressed at the new final batch these are
+192 and 768 final-batch-equivalent updates; the full budget is 3,576 such
+updates. Validation remains every 67,108,864 tokens.
+
+**Single-stage run.** Launch proxy seed 0 directly. There is no benchmark,
+smoke, standalone health stage, validation-envelope kill or automatic next
+experiment. Abort only on infrastructure failure or non-finite loss/gradient.
+Log every update and validation to local JSONL and W&B, including tokens,
+effective batch, accumulation, base/effective LR, train loss, step/train/wall
+time, throughput and phase-aware gradient norm. Retain distinct `latest.pt`
+and `final.pt`; a proxy without a final checkpoint is incomplete.
+
+**Pre-registered interpretation.** Compare against exp012 seed 0
+(`3.581923`, 6,754.76 s training time) and its time to baseline-final loss
+(`3.597773` at 6,582.7 s).
+
+- Clear pass: final loss `<= 3.581923` with training time `<= 6,754.76 s`.
+  This authorises the next combination suite on the exp021 ramp.
+- Quality-only signal: final loss at least 0.004 better than exp012 but misses
+  the time bar. Retain the direction, but first move the ramp start upward or
+  reach the maximum batch earlier rather than stacking more methods blindly.
+- Kill as a replacement: final loss `>= 3.585923` with no faster crossing of
+  `3.597773`, or no loss improvement with higher training time. Return to the
+  exp012 ramp and retry fused SwiGLU there.
+- Anything else is inconclusive and is reviewed from the full loss-vs-token
+  and loss-vs-time curves before choosing the next suite.
