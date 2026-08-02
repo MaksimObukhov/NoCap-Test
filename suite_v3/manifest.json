@@ -224,7 +224,7 @@
       "stages": ["accounting", "proxy"],
       "accounting": {
         "expectations": {
-          "parameter_count": 123533568,
+          "parameter_count": 123532032,
           "mlp_hidden_width": 3072,
           "tying_preserved": true
         }
@@ -233,7 +233,7 @@
         "reference": "baseline_proxy_seed0",
         "pass_loss": 3.593773,
         "kill_loss": 3.601773,
-        "extra_args": ["--mlp_ratio", "4.0", "--lr_schedule", "cosine"],
+        "extra_args": ["--mlp_ratio", "4.0", "--lr_schedule", "cosine", "--warmdown_iters", "0"],
         "use_exp012_stack_ramp": false,
         "envelope_reference": "baseline",
         "envelope_margin": 0.25

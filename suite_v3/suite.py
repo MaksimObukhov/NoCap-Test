@@ -474,51 +474,30 @@ def run_checkpoint_validation(manifest, experiment, stage_dir, options, ledger):
             path = os.path.join(options.checkpoint_root, path)
         entry = {"path": path}
         if not os.path.exists(path):
-            entry["error"] = "missing"
-            failures.append(f"{key}: missing at {path}")
+            entry["missing"] = True
+            failures.extend(
+                f"{key}: {problem}"
+                for problem in gates.checkpoint_field_failures(declared, entry)
+            )
             findings[key] = entry
             continue
-        size = os.path.getsize(path)
-        entry["bytes"] = size
-        if size != declared["bytes"]:
-            failures.append(
-                f"{key}: {size} bytes, expected {declared['bytes']}"
-            )
-        digest = sha256_file(path)
-        entry["sha256"] = digest
-        if digest != declared["sha256"]:
-            failures.append(f"{key}: sha256 {digest} != {declared['sha256']}")
-            findings[key] = entry
-            continue
+        entry["bytes"] = os.path.getsize(path)
+        entry["sha256"] = sha256_file(path)
+        if entry["sha256"] == declared["sha256"]:
+            import torch
 
-        import torch
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            checkpoint_args = checkpoint.get("args", {})
+            entry["next_step"] = checkpoint.get("next_step")
+            entry["tokens_seen"] = checkpoint.get("tokens_seen")
+            entry["run_mode"] = checkpoint_args.get("run_mode")
+            entry["seed"] = checkpoint_args.get("seed")
+            entry["state_keys"] = sorted(checkpoint.keys())
+            del checkpoint
 
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        checkpoint_args = checkpoint.get("args", {})
-        entry["next_step"] = checkpoint.get("next_step")
-        entry["tokens_seen"] = checkpoint.get("tokens_seen")
-        entry["run_mode"] = checkpoint_args.get("run_mode")
-        entry["seed"] = checkpoint_args.get("seed")
-        for field, expected in (
-            ("next_step", declared["expect_next_step"]),
-            ("tokens_seen", declared["expect_tokens_seen"]),
-        ):
-            if entry.get(field) != expected:
-                failures.append(
-                    f"{key}: {field} {entry.get(field)} != {expected}"
-                )
-        if entry["run_mode"] != declared["expect_run_mode"]:
-            failures.append(
-                f"{key}: run_mode {entry['run_mode']} != "
-                f"{declared['expect_run_mode']}"
-            )
-        if entry["seed"] != declared["expect_seed"]:
-            failures.append(f"{key}: seed {entry['seed']} != {declared['expect_seed']}")
-        for required in ("model", "optimizer", "train_loader", "rng_state"):
-            if required not in checkpoint:
-                failures.append(f"{key}: checkpoint missing {required}")
+        problems = gates.checkpoint_field_failures(declared, entry)
+        failures.extend(f"{key}: {problem}" for problem in problems)
         findings[key] = entry
-        del checkpoint
 
     decision = gates.PASS if not failures else gates.INVALID
     result = gates._decision(

@@ -311,6 +311,42 @@ def spike_clusters(records, phase, spike_multiple=10.0):
     }
 
 
+def checkpoint_field_failures(declared, observed):
+    """Compare an exp016 replay checkpoint against its pinned declaration.
+
+    exp016's own Stage A validator checks a few args and a commit prefix, but
+    not finality, step, tokens or content hash, so a mid-run baseline
+    checkpoint with the right run_mode could have passed it. The suite
+    validates canonicity here first and treats the branch script's opinion as
+    a second check rather than the gate.
+    """
+    failures = []
+    if observed.get("missing"):
+        return [f"missing at {observed.get('path')}"]
+    if observed.get("bytes") != declared["bytes"]:
+        failures.append(
+            f"bytes {observed.get('bytes')} != {declared['bytes']}"
+        )
+    if observed.get("sha256") != declared["sha256"]:
+        failures.append(f"sha256 {observed.get('sha256')} != {declared['sha256']}")
+        # A content mismatch makes every other field meaningless.
+        return failures
+    for field, key in (
+        ("next_step", "expect_next_step"),
+        ("tokens_seen", "expect_tokens_seen"),
+        ("run_mode", "expect_run_mode"),
+        ("seed", "expect_seed"),
+    ):
+        if observed.get(field) != declared[key]:
+            failures.append(
+                f"{field} {observed.get(field)!r} != {declared[key]!r}"
+            )
+    for required in ("model", "optimizer", "train_loader", "rng_state"):
+        if required not in observed.get("state_keys", []):
+            failures.append(f"checkpoint missing {required}")
+    return failures
+
+
 def suite_should_continue(decision):
     """Whether a stage decision permits running the next stage downstream.
 
