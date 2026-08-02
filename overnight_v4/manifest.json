@@ -11,7 +11,7 @@
     },
     "exp023": {
       "branch": "exp023/fp8-lm-head-integration",
-      "commit": "b4e4972ba79594cdb7178a7998dc9398b594df4c"
+      "commit": "00784a9ac8c2e1d110881c1a844f9f63c0c68e66"
     },
     "exp016": {
       "branch": "exp016/descent-budgeted-md-adamw-v4",
