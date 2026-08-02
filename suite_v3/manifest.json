@@ -1,0 +1,248 @@
+{
+  "suite_id": "proxy-suite-v3",
+  "manifest_version": 3,
+  "wandb_project": "nocap-baseline",
+  "token_budget": 937426944,
+  "notes": [
+    "No stage in this manifest may run a full run. There is deliberately no",
+    "'full' run_mode anywhere in this file and the launcher asserts it.",
+    "Benchmark stages run a FLAT effective batch for both control and",
+    "treatment so every retained update covers identical tokens; the ramp's",
+    "systems cost is architecture-independent and already measured at +1.59%."
+  ],
+  "references": {
+    "baseline_proxy_seed0": {
+      "label": "exp000 baseline proxy seed 0, 4D GELU, flat 524288 batch",
+      "final_val_loss": 3.597773,
+      "training_time_seconds": 7403.114698443562,
+      "seed_sample_std": 0.0017983247746408055,
+      "source": "nocap-runs-backup/baseline-20260718T074451Z/proxy-seed-0"
+    },
+    "exp012_proxy_seed0": {
+      "label": "exp012 proxy seed 0, uniform 3D GELU plus exp001 batch ramp",
+      "final_val_loss": 3.581923246383667,
+      "training_time_seconds": 6754.759644524125,
+      "source": "night-20260802-v2/exp012/proxy-seed-0"
+    },
+    "exp007_proxy_seed0": {
+      "label": "exp007 proxy seed 0, uniform 3D GELU, flat batch",
+      "final_val_loss": 3.616361379623413,
+      "source": "nocap-runs-backup/exp007"
+    }
+  },
+  "canonical_checkpoints": {
+    "exp000_proxy_seed0": {
+      "path": "nocap-runs-backup/baseline-20260718T074451Z/proxy-seed-0/checkpoint.pt",
+      "sha256": "bb909dfe3d3b99258e1d550a62de098877075887551b2dd14695eb55b98034a8",
+      "bytes": 1482759539,
+      "expect_next_step": 1788,
+      "expect_tokens_seen": 937426944,
+      "expect_run_mode": "proxy",
+      "expect_seed": 0,
+      "source_sha256": "61f4afe121c6ee1eb077b0356234cad6d031d7d95ae8ab79f18fcc678cb81cbd"
+    },
+    "exp000_full_seed0": {
+      "path": "nocap-runs-backup/baseline-20260718T074451Z/full-seed-0/checkpoint.pt",
+      "sha256": "893db0f1dfbb582f0a33da598b0e92de0e56bcac3322a002140c6839d3010b4b",
+      "bytes": 1482759539,
+      "expect_next_step": 4768,
+      "expect_tokens_seen": 2499805184,
+      "expect_run_mode": "full",
+      "expect_seed": 0,
+      "source_sha256": "61f4afe121c6ee1eb077b0356234cad6d031d7d95ae8ab79f18fcc678cb81cbd"
+    }
+  },
+  "control": {
+    "id": "control",
+    "branch": "exp/proxy-suite-v3",
+    "sha": null,
+    "description": "Shared parameterized base. Serves as the benchmark control at whichever --mlp_ratio the experiment requires."
+  },
+  "common_args": {
+    "proxy": [
+      "--run_mode", "proxy",
+      "--model", "d12",
+      "--num_iterations", "1788",
+      "--batch_size", "16",
+      "--sequence_length", "1024",
+      "--grad_accumulation_steps", "32",
+      "--learning_rate", "0.0018",
+      "--weight_decay", "0.1",
+      "--warmup_iters", "96",
+      "--warmdown_iters", "384",
+      "--val_loss_every", "128",
+      "--val_batch_size", "16",
+      "--save_every", "256",
+      "--seed", "0",
+      "--abort_on_nonfinite"
+    ],
+    "benchmark": [
+      "--run_mode", "custom",
+      "--model", "d12",
+      "--num_iterations", "50",
+      "--batch_size", "16",
+      "--sequence_length", "1024",
+      "--grad_accumulation_steps", "32",
+      "--learning_rate", "0.0018",
+      "--weight_decay", "0.1",
+      "--warmup_iters", "0",
+      "--warmdown_iters", "0",
+      "--val_loss_every", "0",
+      "--save_every", "0",
+      "--seed", "0",
+      "--skip_final_checkpoint",
+      "--profile",
+      "--profile_wait_steps", "46",
+      "--profile_warmup_steps", "1",
+      "--profile_active_steps", "1"
+    ],
+    "exp012_stack": [
+      "--mlp_ratio", "3.0",
+      "--batch_ramp_start_accumulation_steps", "8",
+      "--batch_ramp_fraction", "0.5"
+    ]
+  },
+  "experiments": [
+    {
+      "id": "exp018",
+      "order": 1,
+      "enabled": true,
+      "branch": "exp/proxy-suite-v3",
+      "sha": null,
+      "treatment": "FP8 compute path for the lm_head vocab projection, feasibility measurement only",
+      "stages": ["fp8_microbench"],
+      "fp8_microbench": {
+        "script": "suite_v3/fp8_microbench.py",
+        "minimum_projected_full_step_gain_pct": 5.0,
+        "reference_step_time_ms": 3731.0,
+        "vocab_size": 50257,
+        "padded_vocab_size": 50272,
+        "n_embd": 768,
+        "tokens_per_microbatch": 16384,
+        "microbatches_per_step": 32
+      },
+      "expected_minutes": 5
+    },
+    {
+      "id": "exp019",
+      "order": 2,
+      "enabled": true,
+      "branch": "exp019/swiglu-fused-ramp",
+      "sha": null,
+      "treatment": "Fused 2D SwiGLU with the exact exp012 batch ramp and gradient clipping at 10",
+      "stages": ["accounting", "benchmark", "proxy"],
+      "accounting": {
+        "expectations": {
+          "parameter_count": 109376256,
+          "mlp_parameters_per_layer": 3538944,
+          "mlp_hidden_width": 1536,
+          "tying_preserved": true
+        },
+        "reference_equivalence": "two_linear_swiglu"
+      },
+      "benchmark": {
+        "control_mlp_ratio": 3.0,
+        "treatment_args": ["--mlp_ratio", "2.0"],
+        "warning_regression_pct": 1.0,
+        "kill_regression_pct": 2.0,
+        "drift_tolerance_pct": 1.0
+      },
+      "proxy": {
+        "reference": "exp012_proxy_seed0",
+        "pass_loss": 3.577923,
+        "kill_loss": 3.585923,
+        "extra_args": ["--mlp_ratio", "2.0", "--grad_clip", "10.0"],
+        "use_exp012_stack_ramp": true,
+        "envelope_reference": "exp012",
+        "envelope_margin": 0.25
+      },
+      "expected_minutes": 140
+    },
+    {
+      "id": "exp017",
+      "order": 3,
+      "enabled": true,
+      "branch": "exp017/no-wd-tied-embedding",
+      "sha": null,
+      "treatment": "Selective weight decay: tied wte/lm_head exempted, 0.1 retained elsewhere, on the exp012 stack",
+      "stages": ["accounting", "proxy"],
+      "accounting": {
+        "expectations": {
+          "parameter_count": 109376256,
+          "mlp_hidden_width": 2304,
+          "tying_preserved": true,
+          "optimizer_groups_cover_all_parameters": true,
+          "optimizer_group_count": 2,
+          "no_decay_parameter_count": 38597376,
+          "no_decay_tensor_count": 1
+        }
+      },
+      "proxy": {
+        "reference": "exp012_proxy_seed0",
+        "pass_loss": 3.577923,
+        "kill_loss": 3.585923,
+        "extra_args": ["--no_wd_tied_embedding"],
+        "use_exp012_stack_ramp": true,
+        "envelope_reference": "exp012",
+        "envelope_margin": 0.25
+      },
+      "expected_minutes": 118
+    },
+    {
+      "id": "exp016",
+      "order": 4,
+      "enabled": true,
+      "branch": "exp016/descent-budgeted-md-adamw",
+      "sha": null,
+      "treatment": "Descent-Budgeted Multi-Directional AdamW on attention-V updates",
+      "stages": ["checkpoint_validation", "causal_replay", "proxy"],
+      "checkpoint_validation": {
+        "require": ["exp000_proxy_seed0", "exp000_full_seed0"]
+      },
+      "causal_replay": {
+        "script": "analyze_exp016_a.py",
+        "note": "Runs the experiment branch's own Stage A. The harness validates checkpoint canonicity first; the branch script's own validation is known to be weaker and is treated as a second opinion, not the gate."
+      },
+      "proxy": {
+        "reference": "baseline_proxy_seed0",
+        "pass_loss": 3.593773,
+        "kill_loss": 3.601773,
+        "extra_args": ["--descent-budgeted-attn-v"],
+        "use_exp012_stack_ramp": false,
+        "envelope_reference": "baseline",
+        "envelope_margin": 0.25
+      },
+      "expected_minutes": 155
+    },
+    {
+      "id": "exp020",
+      "order": 5,
+      "enabled": true,
+      "branch": "exp020/cosine-schedule",
+      "sha": null,
+      "treatment": "Cosine LR schedule against baseline trapezoid WSD, unchanged 4D architecture and flat batch",
+      "stages": ["accounting", "proxy"],
+      "accounting": {
+        "expectations": {
+          "parameter_count": 123533568,
+          "mlp_hidden_width": 3072,
+          "tying_preserved": true
+        }
+      },
+      "proxy": {
+        "reference": "baseline_proxy_seed0",
+        "pass_loss": 3.593773,
+        "kill_loss": 3.601773,
+        "extra_args": ["--mlp_ratio", "4.0", "--lr_schedule", "cosine"],
+        "use_exp012_stack_ramp": false,
+        "envelope_reference": "baseline",
+        "envelope_margin": 0.25
+      },
+      "expected_minutes": 126
+    }
+  ],
+  "envelopes": {
+    "exp012": [[0, 11.249663352966309], [67158016, 5.40081262588501], [134348800, 4.728166103363037], [201457664, 4.46146821975708], [268550144, 4.316157817840576], [335691776, 4.22925066947937], [402997248, 4.179065227508545], [470073344, 4.125882148742676], [537182208, 4.091776371002197], [604291072, 4.059164762496948], [671399936, 4.0235137939453125], [738508800, 4.001864910125732], [805617664, 3.9369049072265625], [872726528, 3.874192714691162], [937426944, 3.831923246383667]],
+    "baseline": [[0, 11.191801071166992], [67108864, 6.164912223815918], [134217728, 5.35156774520874], [201326592, 4.905668258666992], [268435456, 4.547155380249023], [335544320, 4.3751115798950195], [402653184, 4.285287857055664], [469762048, 4.204335689544678], [536870912, 4.1569249629974365], [603979776, 4.1029953956604], [671088640, 4.061508893966675], [738197504, 4.03541111946106], [805306368, 3.9608373641967773], [872415232, 3.8925278186798096], [937426944, 3.8477730751037598]]
+  }
+}
