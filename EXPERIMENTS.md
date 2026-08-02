@@ -118,7 +118,9 @@ proposal's cost but does not predict a loss improvement.
 | exp018 | completed forward feasibility measurement, pass | FP8 compute path for the `lm_head` vocab projection | BF16 forward median 10.724 ms vs FP8 cast+GEMM 4.572 ms; forward-only projected full-step gain 5.28% on RTX 4090 | Authorises a separate integration benchmark only after the architecture winner. Backward, tied-weight integration, padded-vocabulary masking and training quality remain unvalidated |
 | exp019 | attempted v3, infrastructure-invalid | Fused 2D SwiGLU (one `Linear(768->3072)` + `chunk(2)`) plus the exact exp012 batch ramp, with gradient clipping at 10 | Accounting passed at 109,376,256 parameters and exact fused/reference equivalence; treatment benchmark failed before training because its validation path remained relative | No systems or proxy result. Retry later with absolute train and validation globs; this remains the next architecture candidate if exp021 does not justify a new combination |
 | exp020 | completed proxy s0, killed | Cosine LR schedule against the baseline trapezoid WSD, unchanged 4D architecture and flat 524,288 batch | 3.676178, delta +0.078405 vs baseline (+43.6 sigma); exact 937,426,944-token budget | Strong negative result for this horizon: close cosine unchanged and do not run seeds 1/2 |
-| exp021 | planned direct proxy s0 | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | Awaiting one 937,426,944-token proxy; no benchmark, smoke or separate health stage | Tests whether more frequent, noisier early updates improve time-to-quality enough to repay additional optimizer-step overhead. The next multi-method suite is conditional on this result |
+| exp021 | completed proxy s0, quality pass | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | 3.567184, delta -0.014740 vs exp012 (-8.2 sigma); 937,426,944 tokens in 7,224 updates; 6,782.06 s training time | Missed the literal exp012 time bar by 27.30 s but reached exp012's final loss about 137 s earlier. Promote the schedule as the combination base and retain exp021 as the fallback full candidate |
+| exp022 | planned proxy s0, conditional full | On the exact exp021 schedule combine fused 2D SwiGLU, global clip 10, and selective no-WD for the tied embedding/head | Awaiting one direct proxy; compare loss-vs-training-time with exp021 at the exact 937,426,944-token budget | If the package passes the pre-registered winner rule, run exp022 BF16 full at the exact 2.70B-token budget; otherwise run exp021 full. No FP8 is allowed in this first full |
+| exp023 | planned integration benchmark | FP8 compute only for the padded tied lm_head of the selected exp021/exp022 architecture | Awaiting bracketed exact-shape full-update benchmark, including forward/backward, true-vocab loss slicing and tying checks | A measured >=3% complete-step gain with valid numerics authorises a separate FP8 proxy later; it never launches an FP8 proxy or full automatically |
 
 ## Completed experiments
 
@@ -1838,8 +1840,8 @@ W&B stage artifact: https://wandb.ai/m-obukhov-home/nocap-baseline/runs/o7u2wfwq
 
 ## exp021 — aggressive small-batch ramp on uniform 3D
 
-**Status:** planned for direct proxy seed 0. No full run is authorised by this
-row.
+**Status:** completed direct proxy seed 0 on 2 August 2026; promoted as the
+fallback full candidate and the schedule base for exp022.
 
 **Question.** exp002 measured a mid-run critical batch near 106k, while exp012
 ramps from 131,072 to 524,288 and spends the second half of the proxy at the
@@ -1894,3 +1896,96 @@ and `final.pt`; a proxy without a final checkpoint is incomplete.
   exp012 ramp and retry fused SwiGLU there.
 - Anything else is inconclusive and is reviewed from the full loss-vs-token
   and loss-vs-time curves before choosing the next suite.
+
+**Result.** The proxy completed the exact `937,426,944`-token budget in 7,224
+optimizer updates. Final validation loss was `3.567184`, improving on exp012 by
+`-0.014740` (about `-8.2 sigma`) and on the baseline by `-0.030589`. Training
+time was `6,782.06 s`, 27.30 seconds (`0.40%`) above exp012, so the literal
+clear-pass time condition was missed and the registered label is
+quality-only. The more relevant time-to-quality curve is positive: linear
+interpolation between the fixed validation points places the crossing of
+exp012's final `3.581923` about 137 seconds and 23M tokens earlier than exp012.
+The treatment led exp012 at every non-zero validation checkpoint.
+
+The run was finite throughout. Warmup / steady / warmdown maximum pre-clip
+gradient norms were `7.24 / 1.32 / 0.43`, no clipping was enabled, peak memory
+was 9,029 MiB, and the final checkpoint covers the exact token budget
+(`f7087ab3...22bb59`). W&B:
+https://wandb.ai/m-obukhov-home/nocap-baseline/runs/50arvf1s
+
+**Decision.** Promote the complete schedule package (small-batch ramp plus its
+registered `sqrt(B / 524288)` LR coupling) as the base for exp022. This does
+not identify smaller batch independently of LR scaling. Keep exp021 as the
+automatic BF16 full fallback if exp022 fails its winner rule.
+
+## exp022 — fused SwiGLU small-batch combination
+
+**Status:** pre-registered before implementation. One direct proxy seed 0 and
+one conditional BF16 full seed 0 are authorised; no FP8 training is authorised.
+
+**Hypothesis.** exp021 showed that frequent early updates recover quality at
+small wall-time cost, while exp015 showed that equal-leading-FLOP 2D SwiGLU has
+competitive GEMM time but suffered avoidable kernel launches and a single
+large warmup gradient transient. Fusing the gate/value projection removes the
+launch defect. Clip 10 truncates only the measured SwiGLU pathology, and
+exempting the tied embedding/head from weight decay targets the stronger
+cumulative decay exposure created by exp021's 7,224 updates. The experiment
+tests the complete package; it cannot attribute a passing result to any one of
+the three additions.
+
+**Treatment.** Start from exp021 exactly: token-linear accumulation ramp
+`1 -> 16` over the first 50% of tokens, final effective batch 262,144, LR
+`wsd_base_lr * sqrt(effective_batch_tokens / 524288)`, betas `(0.9, 0.95)`,
+token-indexed warmup/warmdown, seed 0 and exact `937,426,944`-token budget.
+Replace each 3D GELU MLP with fused 2D SwiGLU: one bias-free
+`Linear(768, 3072)`, `chunk(2)`, `silu(gate) * value`, then bias-free
+`Linear(1536, 768)`. Keep WD 0.1 on all other parameters and WD 0 only on the
+single tied `wte/lm_head` parameter. Apply global gradient clipping at 10 and
+log the pre-clip norm and clipping coefficient.
+
+**Run and winner rule.** Launch proxy seed 0 directly, without a separate
+benchmark, smoke, health probe or validation-envelope stop. Abort only on an
+infrastructure error or non-finite loss/gradient. exp022 replaces exp021 for
+the BF16 full if either:
+
+- final loss is at most `3.563184` (0.004 better) with training time no more
+  than 2% above exp021's `6,782.06 s`; or
+- interpolated training time to loss `3.567184` is at least 1% below
+  `6,782.06 s`, while final loss is no worse than `3.567184`.
+
+Otherwise exp021 remains the full winner. The selector and all interpolation
+inputs are saved as JSON. A completed proxy must retain `final.pt` and its W&B
+artifact.
+
+**Conditional full.** The winning BF16 branch runs seed 0 to the exact
+`2,700,001,280`-token budget (a multiple of the 16,384-token microbatch) with
+the same token-indexed schedule fractions and a clean compile cache. FP8 is
+excluded. A later hardware-optimised full requires a separate explicit user
+command after exp023 and an FP8 proxy.
+
+## exp023 — FP8 tied-lm-head integration benchmark
+
+**Status:** pre-registered before implementation. This row authorises a
+systems benchmark only, not FP8 proxy or full training.
+
+**Treatment.** After exp022 selects the architecture, instantiate that winner
+with one BF16 master tied embedding/head weight padded from 50,257 to 50,304
+rows. Both control and FP8 treatment use the identical padded parameter and
+slice logits back to the true first 50,257 classes before cross-entropy. The
+padding is therefore a compute-shape device, not a vocabulary or objective
+change. Convert only the inner lm-head linear to TorchAO FP8 training; the
+embedding lookup and optimizer master weight remain BF16.
+
+**Measurement.** On the same RTX 4090, run control-before, FP8 treatment and
+control-after for identical fixed inputs and exact production full updates.
+Use isolated compile caches and report compile-inclusive time separately from
+the median steady complete-step time. Before timing, require finite forward,
+backward and optimizer results, identical weight tying, output shape ending in
+50,257, every target below 50,257, and a recorded one-step loss/gradient delta
+against BF16.
+
+**Decision.** Median FP8 complete-step gain at least 3%, control drift at most
+2%, no graph break/eager fallback, preserved tying and finite numerics pass the
+integration benchmark and authorise a separate clean FP8 proxy on the winner.
+Anything else closes or invalidates the hardware path as appropriate. This
+suite never chains an FP8 proxy or FP8 full automatically.
