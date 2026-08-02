@@ -69,8 +69,8 @@ if ! compgen -G "$DATA_ROOT/fineweb_train_*.bin" >/dev/null \
   echo "FineWeb train/validation shards not found under $DATA_ROOT" >&2
   exit 2
 fi
-if ! "$PYTHON_BIN" -c 'import torch,wandb,torchao; assert torch.cuda.is_available()'; then
-  echo "CUDA, wandb and torchao must be importable before the paid suite" >&2
+if ! "$PYTHON_BIN" -c 'import importlib.metadata as m,torch,wandb,torchao; assert torch.cuda.is_available(); assert m.version("torchao") == "0.17.0"'; then
+  echo "CUDA, wandb and torchao==0.17.0 must be available before the paid suite" >&2
   exit 2
 fi
 
