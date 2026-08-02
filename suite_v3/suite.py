@@ -529,7 +529,14 @@ def run_checkpoint_validation(manifest, experiment, stage_dir, options, ledger):
 
 
 def run_causal_replay(manifest, experiment, worktree, stage_dir, options, ledger):
+    """Run the experiment branch's own Stage A over validated checkpoints.
+
+    analyze_exp016_a.py requires the checkpoints in exactly proxy-then-full
+    order with those two labels, so the manifest's `require` list is ordered
+    to match and the labels come from each entry's expected run mode.
+    """
     spec = experiment["causal_replay"]
+    verdict_path = os.path.join(stage_dir, "stage_a.json")
     command = [options.python, spec["script"]]
     for key in experiment["checkpoint_validation"]["require"]:
         declared = manifest["canonical_checkpoints"][key]
@@ -537,16 +544,17 @@ def run_causal_replay(manifest, experiment, worktree, stage_dir, options, ledger
         if not os.path.isabs(path):
             path = os.path.join(options.checkpoint_root, path)
         command += ["--checkpoint", f"{declared['expect_run_mode']}={path}"]
-    command += ["--output-dir", stage_dir]
+    command += ["--input-bin", options.train_glob, "--output", verdict_path]
     code = run_logged(command, worktree, os.path.join(stage_dir, "stdout.log"))
 
-    verdict_path = os.path.join(stage_dir, "gate_decision.json")
-    if code != 0 or not os.path.exists(verdict_path):
+    if not os.path.exists(verdict_path):
+        # No verdict file means the script failed before deciding anything,
+        # which is an invalid measurement rather than a scientific kill.
         return (
             gates._decision(
                 "causal_replay",
-                gates.KILL if code != 0 else gates.INVALID,
-                {"reason": f"stage A exited {code}"},
+                gates.INVALID,
+                {"reason": f"stage A exited {code} with no verdict at {verdict_path}"},
             ),
             [command],
         )
