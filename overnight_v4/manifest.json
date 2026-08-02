@@ -1,0 +1,21 @@
+{
+  "suite_id": "overnight-v4-20260802",
+  "experiments": {
+    "exp021": {
+      "branch": "exp021/full-2p70b",
+      "commit": "4c072f0ed2ba136026d017dda6ec0174bb19cbb9"
+    },
+    "exp022": {
+      "branch": "exp022/swiglu-small-batch-combo",
+      "commit": "83fb35fadc625cdd56bc4f076cb9773b6051e0fd"
+    },
+    "exp023": {
+      "branch": "exp023/fp8-lm-head-integration",
+      "commit": "b4e4972ba79594cdb7178a7998dc9398b594df4c"
+    },
+    "exp016": {
+      "branch": "exp016/descent-budgeted-md-adamw-v4",
+      "commit": "878aecca0020820a15d5ffe3163cdc4f0592b985"
+    }
+  }
+}
