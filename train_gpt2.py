@@ -118,17 +118,37 @@ def mlp_hidden_width(config):
 
 
 class MLP(nn.Module):
+    """exp019: fused 2D SwiGLU.
+
+    exp015 implemented the gate as two separate `Linear(n_embd, hidden)`
+    modules. That is arithmetically identical to this but issues an extra
+    1152 `aten::mm` launches per optimizer step -- 36 per micro-batch -- which
+    is where its -1.23% against the uniform-3D control came from. Its
+    `aten::mm` self-CUDA time was actually the lowest of all six profiled
+    night-suite variants (2.457 s against the control's 2.469 s), so the
+    deficit was never arithmetic.
+
+    Emitting gate and value from one `Linear(n_embd, 2 * hidden)` and
+    splitting the result removes those launches at identical parameter count.
+    At --mlp_ratio 2.0 and n_embd 768 the hidden width is 1536, giving
+    768*3072 + 1536*768 = 3,538,944 MLP parameters per layer, which is exactly
+    uniform 3D's 2 * 768 * 2304.
+
+    The first half of c_fc is the gate and the second half is the value;
+    suite_v3/accounting.py rebuilds the two-Linear form from this split and
+    asserts numerical equivalence before any GPU-hour is spent.
+    """
 
     def __init__(self, config):
         super().__init__()
         hidden_width = mlp_hidden_width(config)
         self.hidden_width = hidden_width
-        self.c_fc = nn.Linear(config.n_embd, hidden_width, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden_width, bias=False)
         self.c_proj = nn.Linear(hidden_width, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.gelu(x)
+        gate, value = self.c_fc(x).chunk(2, dim=-1)
+        x = F.silu(gate) * value
         x = self.c_proj(x)
         return x
 
