@@ -186,11 +186,18 @@ def run_internal_stage(args):
         raise RuntimeError("padded token leaked into targets")
 
     autocast = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    with torch.no_grad(), autocast:
+        shape_logits, shape_loss = base_model(inputs, targets, return_logits=True)
+    output_vocab_size = shape_logits.shape[-1]
+    if output_vocab_size != TRUE_VOCAB_SIZE or not math.isfinite(float(shape_loss)):
+        raise RuntimeError("untimed true-vocab forward check failed")
+    del shape_logits, shape_loss
+    torch.cuda.empty_cache()
+
     step_times = []
     first_loss = None
     first_grad_norm = None
     first_head_grad_norm = None
-    output_vocab_size = None
     started = time.perf_counter()
     for step in range(args.steps):
         torch.cuda.synchronize()
@@ -200,8 +207,7 @@ def run_internal_stage(args):
         for micro_step in range(ACCUMULATION_STEPS):
             model.require_backward_grad_sync = micro_step == ACCUMULATION_STEPS - 1
             with autocast:
-                logits, loss = model(inputs, targets, return_logits=True)
-                output_vocab_size = logits.shape[-1]
+                _logits, loss = model(inputs, targets, return_logits=False)
                 loss = loss / ACCUMULATION_STEPS
                 accumulated_loss += loss.detach()
             loss.backward()
