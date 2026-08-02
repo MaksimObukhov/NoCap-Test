@@ -113,7 +113,11 @@ proposal's cost but does not predict a loss improvement.
 | exp013 | completed proxy s0, null result | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | 3.597677, delta -0.000096 vs baseline s0 (-0.05 sigma, exact null); systems speedup +0.34%, `aten::mm` time unchanged (-0.5%) | No loss/token or systems benefit; the GELU activation kernel is already fully fused by Inductor, so the model stays GEMM-bound. Close the hypothesis; do not run seeds 1/2 |
 | exp014 | completed proxy s0, killed | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | 3.624233, delta +0.026460 vs baseline s0 (+14.7 sigma), +0.007872 worse than exp007 uniform 3D (+4.4 sigma); benchmark +0.17% vs uniform-3D control | Killed by the pre-registered proxy gate. Per-layer gradient RMS at update 256 shows the allocation prior was backwards: layers 8-11 (given 3.5D) have below-average grad RMS while layers 0-3 (given 2.5D) have 5-8x the mean. Do not run seeds 1/2 |
 | exp015 | health-killed, kill contested | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Health diagnostic killed on 3 gradient spikes and 2 loss spikes (pool median over warmup+post-warmup); benchmark -1.225% vs uniform-3D control, within the -2% threshold; proxy never ran | All spikes (updates 80, 86, 88) fall inside the 96-update warmup and fully recover within one update; post-warmup max grad norm (1.92) is in line with exp012-014. The pooled-median health gate conflates warmup transients with steady-state instability. See exp015 Results below for the reanalysis and the reopening condition |
-| exp016 | planned staged gate | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Awaiting canonical-checkpoint causal replay, correctness/systems gate, then conditional health/proxy | Still blocked: stage A requires frozen-weight checkpoints at exp000 proxy and full seed-0 states. The night suite's proxy checkpoints were mid-run and overwritten (`skip_final_checkpoint: true`, `save_every` rotation onto one file), so no canonical checkpoint exists yet. Unblocks once a full run saves distinct, retained checkpoints |
+| exp016 | planned staged gate, unblocked | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Awaiting canonical-checkpoint causal replay, correctness/systems gate, then conditional health/proxy | **Unblocked.** The blocker recorded here was wrong: it described the night suite's rotated mid-run checkpoints, but exp000's own 18 July run retained final checkpoints for both required states (proxy `next_step` 1788 / 937,426,944 tokens; full `next_step` 4768 / 2,499,805,184 tokens), each carrying model, optimizer, loader cursor and RNG state. Hashes pinned in the exp016 canonical-checkpoint manifest below |
+| exp017 | planned, proxy suite v3 | Selective weight decay: exempt only the tied `wte`/`lm_head` matrix from WD 0.1, on the full exp012 stack | Awaiting optimizer-group accounting gate and proxy seed 0 | The baseline calls `AdamW(self.parameters(), weight_decay=0.1)` with no parameter groups, so 35.3% of the model (38,597,376 tied embedding parameters) is decayed. Framed as a regularization choice, not a bug fix |
+| exp018 | planned, measurement only | FP8 compute path for the `lm_head` vocab projection | Awaiting standalone shape-exact microbenchmark; no training integration this round | The vocab projection is 702.2 ms of every optimizer step and is byte-for-byte invariant across all six night-suite variants — 19.9% of the 4D step and 23.4% of the uniform-3D step. Largest untouched systems target. Integration is authorised only by a measured projected full-step gain >= 5% |
+| exp019 | planned, proxy suite v3 | Fused 2D SwiGLU (one `Linear(768->3072)` + `chunk(2)`) plus the exact exp012 batch ramp, with gradient clipping at 10 | Awaiting accounting, bracketed benchmark and proxy seed 0 | exp015's -1.23% was launch overhead, not arithmetic: its `aten::mm` time was the lowest of all six variants (2.457 s) but it issued 5,856 mm calls against 4,704. Reopens exp015 with the fusion fix and a clip threshold inert for the controls |
+| exp020 | planned, proxy suite v3, run last | Cosine LR schedule against the baseline trapezoid WSD, unchanged 4D architecture and flat 524,288 batch | Awaiting proxy seed 0 | Weak prior: trapezoid WSD is generally at least as good as cosine for speedruns. Recorded honestly as scheduler research with scope risk, not as the main contribution. Ordered last so it is the first thing cut if the suite runs long |
 
 ## Completed experiments
 
@@ -1502,3 +1506,269 @@ fallback, hidden recompile, OOM, or non-V mismatch.
 no-clipping health diagnostic and then proxy seed 0. Loss `<= 3.593773` passes,
 loss `>= 3.601773` kills, and the interval is inconclusive. Any provenance,
 token/order, artifact, or W&B failure invalidates the stage and stops the suite.
+
+## Proxy suite v3 — funnel design
+
+**Status:** pre-registered 2 August 2026, before implementation. This section
+fixes the gate structure for exp017-exp020 and the re-run of exp016.
+
+**What changed versus the night-20260802-v2 funnel and why.**
+
+The v2 funnel was `benchmark -> 256-update health -> proxy` for every
+experiment. Its health stage produced one confirmed false kill (exp015) and
+cost roughly 16 GPU-minutes per experiment for a statistic that could not
+observe anything past update 256. v3 removes the separate health stage and
+replaces it with in-run instrumentation plus two tripwires inside the proxy
+itself:
+
+- every logged update carries the pre-clip global gradient norm, the clipping
+  coefficient, whether clipping activated, and a phase tag
+  (`warmup` / `steady` / `warmdown`) derived from the production token clock;
+- a non-finite loss or gradient aborts the stage immediately;
+- a validation loss above a pre-registered per-experiment envelope aborts the
+  stage.
+
+This is strictly more information than the v2 health probe (whole run rather
+than 256 updates, real scheduler and real ramp rather than a substitute
+regime), it removes the pooled warmup/steady median that caused the exp015
+false kill, and it removes one stage of harness surface. Health statistics
+are reported per phase and are never pooled across warmup and steady state.
+
+**Envelope definition.** The envelope is the appropriate reference run's own
+validation curve plus a fixed margin of 0.25 nats, evaluated at the matching
+validation checkpoint. exp017 and exp019 use the exp012 proxy curve (they
+share its ramp, so their validation checkpoints land on the same token grid);
+exp020 uses the baseline proxy curve. The margin is deliberately loose: the
+envelope exists to stop divergence, not to pre-judge quality. A candidate
+that is merely worse must still finish, because a finished worse run is
+evidence and an aborted one is not.
+
+**Benchmark stages run only where a systems claim exists** — exp019 and
+exp018. exp017 changes only optimizer parameter grouping and exp020 changes
+only the learning-rate schedule shape; neither can move throughput, so
+neither gets a benchmark stage. Where a benchmark does run it is bracketed
+control-before / treatment / control-after on the same host, and the reported
+statistic is the paired median steady-state complete-step time plus a
+separate compile-inclusive end-to-end number.
+
+**Accounting is a mandatory first stage for every experiment.** It costs
+about 30 seconds, runs no training, and checks parameter counts against the
+declared reference, weight-tying identity, optimizer-group coverage (every
+parameter in exactly one group), and, where a reference implementation
+exists, numerical equivalence against it. An accounting failure kills the
+experiment before any GPU-hour is spent.
+
+**Suite-level rules.** A failure inside one experiment is recorded and the
+suite continues to the next experiment; only preflight, disk, or GPU
+failures stop the suite. No stage in this suite may run a full run, and the
+launcher is required to contain no full stage. Proxy stages may not report
+`complete` without a validated `checkpoints/final.pt`.
+
+## exp016 — canonical checkpoint manifest
+
+**Status:** unblocked 2 August 2026. Supersedes the "still blocked" note in
+the overview table.
+
+Stage A requires frozen-weight replay at the exp000 proxy and full seed-0
+states. Both exist in `nocap-runs-backup/baseline-20260718T074451Z/` and were
+verified to be final rather than mid-run:
+
+| State | `next_step` | Tokens | Final validation | `checkpoint.pt` SHA-256 | Bytes |
+|---|---:|---:|---:|---|---:|
+| exp000 proxy seed 0 | 1788 | 937,426,944 | 3.597773 | `bb909dfe3d3b99258e1d550a62de098877075887551b2dd14695eb55b98034a8` | 1,482,759,539 |
+| exp000 full seed 0 | 4768 | 2,499,805,184 | 3.377696 | `893db0f1dfbb582f0a33da598b0e92de0e56bcac3322a002140c6839d3010b4b` | 1,482,759,539 |
+
+Both carry `model`, `optimizer`, `next_step`, `tokens_seen`, `train_loader`,
+`next_x`/`next_y` and full `rng_state`. Both were produced by the same
+captured source, `train_gpt2.py` SHA-256
+`61f4afe121c6ee1eb077b0356234cad6d031d7d95ae8ab79f18fcc678cb81cbd`
+(27,614 bytes).
+
+**Canonicalisation note.** The recorded git commit is `bd681a33` with
+`git_dirty: true`, so the commit alone does not identify the source. Identity
+is therefore established by the SHA-256 of the captured `train_gpt2.py`, the
+same reconstructibility argument already accepted for exp001. Stage A must
+validate, before loading: checkpoint SHA-256, captured-source SHA-256,
+`next_step`, `tokens_seen`, `args.run_mode`, `args.seed`, and the presence of
+model, optimizer, loader and RNG state. Any mismatch is an invalidation, not
+a scientific result. exp012-exp015 checkpoints must never be substituted.
+
+## exp017 — selective no-weight-decay on the tied embedding
+
+**Status:** planned. No full run is authorised by this row.
+
+**Hypothesis.** The baseline constructs its optimizer as
+`AdamW(self.parameters(), weight_decay=0.1)` with no parameter groups, so
+weight decay is applied uniformly to every parameter. Because `wte.weight`
+and `lm_head.weight` are tied, that single 50,257 x 768 matrix is 38,597,376
+parameters, or 35.3% of the 109,376,256-parameter 3D stack, and it is decayed
+at the same rate as the transformer blocks. Decaying the shared
+embedding/unembedding matrix shrinks logit scale and disproportionately
+erodes rare-token rows that receive gradient on few steps. Exempting only
+that matrix, while leaving weight decay at 0.1 everywhere else, should
+improve loss per token at exactly zero systems cost.
+
+This is an experimental regularization choice, not a bug fix. Blanket weight
+decay is a defensible default; the claim under test is only that this model
+at this scale does better without it on the tied matrix.
+
+**What is held fixed.** The complete exp012 stack: uniform 3D MLP, the exact
+exp001 batch ramp 131,072 -> 524,288 over the first 50% of tokens, LR scaled
+by `sqrt(batch / 524288)`, peak LR 0.0018, betas (0.9, 0.95), token-indexed
+WSD with warmup 96 and warmdown 384 final-batch-equivalent updates, seed 0,
+identical token order, and the 937,426,944-token budget.
+
+**Funnel.** Accounting gate, then proxy seed 0. No benchmark stage: parameter
+grouping cannot change throughput.
+
+- Accounting passes only if the tied matrix is a single shared tensor present
+  in exactly one optimizer group with `weight_decay == 0.0`, every other
+  parameter is in exactly one group with `weight_decay == 0.1`, the union of
+  groups covers every parameter exactly once, and the total parameter count is
+  unchanged at 109,376,256.
+- Proxy loss `<= 3.577923` (at least 0.004 better than exp012's 3.581923)
+  passes and makes exp017 the new combo reference.
+- Proxy loss `>= 3.585923` kills the treatment.
+- The interval `(3.577923, 3.585923)` is inconclusive and does not promote.
+
+## exp018 — FP8 lm_head feasibility measurement
+
+**Status:** planned, measurement only. This row authorises no training run.
+
+**Motivation from the night-20260802-v2 profiler.** Two 32-call cutlass
+kernels — one call per micro-batch — account for 386.8 ms and 315.3 ms of
+every optimizer step, and they are invariant to within 0.2 ms across all six
+profiled variants (baseline 4D, uniform 3D, exp012, exp013, exp014, exp015).
+That identifies them as the vocab projection, untouched by every MLP
+treatment tried so far. With the log-softmax block they are 816.3 ms of the
+4,113 ms 4D step (19.85%) and 874.1 ms of the 3,731 ms uniform-3D step
+(23.43%). After 3D narrowing the share rises, because the denominator fell
+and the numerator did not. It is the largest remaining systems target and is
+orthogonal to everything in the current queue.
+
+**Scope this round.** Standalone shape-exact microbenchmark only. No training
+integration, no proxy, no interaction with exp017 or exp019.
+
+**What is measured.** On the target RTX 4090 (sm_89), at the exact production
+shapes — activations `(16, 1024, 768)` flattened to `(16384, 768)` against a
+`(768, 50257)` projection — time the BF16 baseline and the FP8
+`torch._scaled_mm` path for: forward, grad-input, grad-weight, and the cast
+and scale-computation overhead separately from the GEMM itself. `_scaled_mm`
+requires 16-divisible dimensions and 50,257 is not, so the padded compute
+shape 50,272 must be measured explicitly; padding is a compute-shape device
+only and cross-entropy is always taken over the true 50,257 columns.
+
+**Gate.** The reported statistic is projected full-optimizer-step gain, that
+is, measured saving on the vocab-projection block divided by the measured
+uniform-3D step time of 3,731 ms.
+
+- Projected full-step gain `>= 5%` authorises a separate integration
+  experiment, which must then preserve `wte`/`lm_head` tying exactly and pass
+  its own numerical-health and proxy gates.
+- Projected full-step gain `< 5%` stops FP8 here and is recorded as a measured
+  negative, not as an untested idea.
+- Broken tying, a required change to the true vocabulary, or non-finite
+  outputs invalidate the measurement.
+
+A realistic prior is 4.7-7.5%, straddling the threshold, which is why the
+measurement is worth five GPU-minutes and the integration is not yet worth
+its implementation risk.
+
+## exp019 — fused 2D SwiGLU with the exp012 batch ramp
+
+**Status:** planned. Reopens exp015 under the condition recorded in that row.
+
+**Hypothesis.** exp015's -1.225% benchmark result against the uniform-3D
+control was kernel-launch overhead, not arithmetic. Its `aten::mm` self-CUDA
+time was 2.457 s, the lowest of all six profiled variants and below the
+uniform-3D control's 2.469 s, while it issued 5,856 `aten::mm` calls against
+4,704 — an extra 1,152 launches per optimizer step, exactly 36 per micro-batch,
+produced by implementing the gate as two separate `Linear(768, 1536)` modules.
+Merging them into one `Linear(768, 3072)` followed by `chunk(2, dim=-1)`
+should remove those launches at identical parameter count and identical
+arithmetic. If fused SwiGLU then matches uniform-3D throughput while
+recovering part of the +0.018588 capacity penalty that 3D narrowing pays,
+it replaces uniform 3D inside the exp012 combination.
+
+**Treatment.** Fused 2D SwiGLU (`hidden_width = 2 * n_embd = 1536`, one
+`Linear(768, 3072, bias=False)` split by `chunk(2, dim=-1)` into gate and
+value, `silu(gate) * value`, then `Linear(1536, 768, bias=False)`), plus the
+exact exp012 batch ramp and LR scaling, plus global gradient clipping at
+threshold 10.
+
+**Why clipping is part of the treatment and why 10.** exp015's health kill was
+a false positive of the pooled-median gate, but the underlying transient was
+real and larger than anything the other candidates produced: at update 80,
+inside the 96-update warmup, the global gradient norm reached 63.94 against a
+maximum of 4.72 across exp012, exp013 and exp014. It self-corrected in a
+single update (loss +0.968 then -0.946, parameter norm continuing smooth at
+224.5 -> 224.8 -> 225.2, zero non-finite values), and with betas (0.9, 0.95)
+AdamW's second moment forgets it within roughly 40 updates. Post-warmup,
+exp015's maximum gradient norm was 1.92 against exp013's 0.81 and exp014's
+0.96. The correct response to a real but self-correcting multiplicative-gate
+transient is to truncate it, not to abandon the architecture. Threshold 10 is
+above every gradient norm ever observed in exp012, exp013 and exp014, so it is
+inert for the controls and fires only on the pathological event; clipping
+activation count and the pre-clip norm distribution are logged per phase and
+reported, so a claim that clipping did the work is falsifiable.
+
+The comparison is therefore fused-SwiGLU-plus-clip against exp012, and the
+report must state that clipping is confounded with the architecture change.
+If exp019 passes, a clip-only control on the exp012 stack is required before
+the result is attributed to SwiGLU.
+
+**Funnel.** Accounting, then bracketed benchmark, then conditional proxy.
+
+- Accounting passes only if leading MLP parameters and FLOPs match uniform 3D
+  exactly (3,538,944 MLP parameters per layer, against uniform 3D's
+  2 x 768 x 2304 = 3,538,944), total parameters equal 109,376,256, and the
+  fused implementation is numerically equivalent to the two-Linear exp015 form
+  given the same weights, to within bf16 tolerance.
+- Benchmark against exp012 as the control, bracketed control-before /
+  treatment / control-after: regression `<= 1%` passes; 1-2% is a warning and
+  the proxy may still proceed; regression `> 2%` kills. Eager fallback, graph
+  break, unexpected recompilation, or an accounting mismatch invalidates the
+  stage rather than producing a verdict.
+- Proxy loss `<= 3.577923` passes and makes exp019 the new combo reference;
+  `>= 3.585923` kills it as an exp012 replacement unless time-to-target is
+  materially better; the interval is inconclusive.
+
+## exp020 — cosine schedule versus baseline WSD
+
+**Status:** planned, ordered last in the suite. Scheduler research with
+acknowledged scope risk; not the main contribution of this project.
+
+**Hypothesis, stated honestly.** The prior is weak and points at a null: the
+trapezoid warmup-stable-decay schedule used by the baseline is generally at
+least as good as cosine for short-horizon speedruns, which is why
+modded-nanogpt uses it. This row exists so the queue closes the question with
+a measurement on this exact stack rather than by appeal to other people's
+results.
+
+**What is held fixed.** Unchanged 4D baseline architecture, flat 524,288-token
+effective batch with no ramp, peak LR 0.0018, betas (0.9, 0.95), weight decay
+0.1 applied as in the baseline, identical data and token order, identical
+937,426,944-token budget, seed 0. Only the schedule shape changes. Cosine is
+never combined with the batch ramp in this experiment.
+
+**Complete cosine definition, fixed before implementation.** Let `T` be the
+937,426,944-token budget and `W` the warmup token count, equal to the WSD
+baseline's 96 final-batch-equivalent updates, that is 50,331,648 tokens. For
+tokens `t`:
+
+- `t < W`: `lr(t) = 0.0018 * (t + update_tokens) / W`, capped at 0.0018,
+  identical to the WSD warmup already implemented;
+- `t >= W`: `lr(t) = 0.0018 * 0.5 * (1 + cos(pi * p))` with
+  `p = (t - W) / (T - W)`.
+
+No minimum-LR floor, no restarts, no separate decay horizon. `lr(T) = 0`
+exactly, matching the WSD baseline's terminal LR.
+
+**Funnel.** Accounting, then proxy seed 0. No benchmark stage: schedule shape
+cannot move throughput.
+
+- Proxy loss `<= 3.593773` (at least 0.004 better than baseline seed 0's
+  3.597773) passes.
+- Proxy loss `>= 3.601773` kills cosine for this stack.
+- The interval `(3.593773, 3.601773)` is inconclusive, which given the stated
+  prior is the most likely outcome and is a legitimate reportable result.
