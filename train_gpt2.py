@@ -386,6 +386,38 @@ def envelope_limit_at(points, tokens):
     return points[-1][1]
 
 
+def checkpoint_destination(checkpoint_dir, kind, next_step):
+    """Resolve where a checkpoint of a given kind is written.
+
+    Module-level and pure so the "latest can never land on final" guard is
+    directly testable. In the v2 suite every periodic save rotated onto one
+    `checkpoint.pt`, so exp012-exp014 kept only a mid-run snapshot and their
+    final weights do not exist.
+    """
+    final_path = os.path.join(checkpoint_dir, "final.pt")
+    if kind == "final":
+        return final_path
+    if kind == "milestone":
+        destination = os.path.join(checkpoint_dir, f"milestone-step{next_step:06d}.pt")
+    elif kind == "latest":
+        destination = os.path.join(checkpoint_dir, "latest.pt")
+    else:
+        raise ValueError(f"unknown checkpoint kind {kind!r}")
+    if os.path.abspath(destination) == os.path.abspath(final_path):
+        raise RuntimeError(f"{kind} checkpoint would overwrite the final checkpoint")
+    return destination
+
+
+def truncate_metrics_records(records, tokens_seen):
+    """Keep only records the resume checkpoint actually saw.
+
+    A checkpoint can lag the last lines written, so appending blindly after a
+    resume duplicates updates in the event log. Dropping everything past the
+    checkpoint's token cursor makes resume idempotent.
+    """
+    return [r for r in records if r.get("tokens_seen", 0) <= tokens_seen]
+
+
 def training_phase(tokens, warmup_tokens, target_tokens, warmdown_tokens):
     """Schedule phase for the token clock, reported per update.
 
@@ -762,18 +794,14 @@ if __name__ == "__main__":
             # blindly on resume duplicates updates. Drop everything the
             # checkpoint did not see, keyed on its token cursor.
             resume_tokens = resume_checkpoint.get("tokens_seen", 0)
-            kept = []
             with open(metrics_path) as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    record = json.loads(line)
-                    if record.get("tokens_seen", 0) <= resume_tokens:
-                        kept.append(line)
+                existing = [
+                    json.loads(line) for line in handle if line.strip()
+                ]
+            kept = truncate_metrics_records(existing, resume_tokens)
             with open(metrics_path, "w") as handle:
-                for line in kept:
-                    handle.write(line + "\n")
+                for record in kept:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
             print0(
                 f"resume: truncated {metrics_path} to {len(kept)} records at "
                 f"or below {resume_tokens:,} tokens"
@@ -956,24 +984,7 @@ if __name__ == "__main__":
         """
         if not master_process:
             return None
-        if kind == "final":
-            destination = final_checkpoint_path
-        elif kind == "milestone":
-            destination = os.path.join(
-                checkpoint_dir, f"milestone-step{next_step:06d}.pt"
-            )
-        elif kind == "latest":
-            destination = latest_checkpoint_path
-        else:
-            raise ValueError(f"unknown checkpoint kind {kind!r}")
-        # Structural guard, asserted rather than assumed: the rotating
-        # checkpoint must never be able to land on the final one.
-        if kind != "final" and os.path.abspath(destination) == os.path.abspath(
-            final_checkpoint_path
-        ):
-            raise RuntimeError(
-                f"{kind} checkpoint would overwrite the final checkpoint"
-            )
+        destination = checkpoint_destination(checkpoint_dir, kind, next_step)
         if kind == "milestone" and os.path.exists(destination):
             # Milestones are immutable; a repeat write means a step collision.
             print0(f"milestone already exists, not rewriting: {destination}")
