@@ -1,87 +1,37 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# LEGACY LAUNCHER -- DISABLED ON PURPOSE.
+#
+# The original run_suite.sh ran `proxy 0`, `proxy 1`, `proxy 2` and then
+# `full 0` with no confirmation. During the night-20260802-v2 review an
+# operator came close to launching an unapproved full run with it, because
+# the name looks like a current entry point and nothing in it hints that the
+# last line costs five GPU-hours.
+#
+# It is kept as a hard failure rather than deleted so that any stale script,
+# note, or muscle-memory invocation stops loudly instead of silently finding
+# nothing -- or worse, finding some newer file that happens to reuse the name.
+#
+# The current entry point is:
+#
+#     ./run_proxy_suite_v3.sh --dry-run
+#
+# which defaults to a dry run and contains no full stage at all. Full runs
+# require Max's explicit approval and are launched deliberately, one at a
+# time, never from a suite script.
 
-SUITE_ID="${1:-baseline-$(date -u +%Y%m%dT%H%M%SZ)}"
-SUITE_DIR="runs/$SUITE_ID"
-export WANDB_GROUP="$SUITE_ID"
+set -euo pipefail
 
-mkdir -p "$SUITE_DIR"
+cat >&2 <<'MESSAGE'
+run_suite.sh is the LEGACY v1 launcher and is disabled.
 
-if [[ "${VAST_AUTO_STOP:-1}" == "1" ]]; then
-  if [[ -z "${CONTAINER_ID:-}" ]]; then
-    echo "CONTAINER_ID is missing; refusing to start without verified auto-stop." >&2
-    echo "Set VAST_AUTO_STOP=0 only if you will stop the instance manually." >&2
-    exit 2
-  fi
-  if ! command -v vastai >/dev/null 2>&1; then
-    echo "vastai CLI is missing; install it before starting the suite." >&2
-    exit 2
-  fi
-  if [[ -z "${CONTAINER_API_KEY:-}" ]]; then
-    echo "CONTAINER_API_KEY is missing; auto-stop would fail unauthenticated." >&2
-    echo "Set VAST_AUTO_STOP=0 only if you will stop the instance manually." >&2
-    exit 2
-  fi
-fi
+It contained an unguarded `full 0` stage. Use the current launcher instead:
 
-stop_vast_instance() {
-  local exit_code=$?
-  trap - EXIT
-  sync
+    ./run_proxy_suite_v3.sh --dry-run     # plan only, no compute
+    ./run_proxy_suite_v3.sh --run-paid    # requires explicit approval
 
-  if [[ "${VAST_AUTO_STOP:-1}" == "1" && -n "${CONTAINER_ID:-}" ]]; then
-    if command -v vastai >/dev/null 2>&1; then
-      echo "Stopping Vast instance $CONTAINER_ID to end GPU billing."
-      stopped=0
-      for attempt in 1 2 3; do
-        if vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"; then
-          echo "Vast instance $CONTAINER_ID stop request succeeded."
-          stopped=1
-          break
-        fi
-        echo "WARNING: vastai stop failed (attempt $attempt); retrying in 30s." >&2
-        sleep 30
-      done
-      if [[ "$stopped" != "1" ]]; then
-        echo "ERROR: auto-stop FAILED; stop the instance manually to end billing." >&2
-      fi
-    else
-      echo "WARNING: vastai CLI is unavailable; stop the instance manually." >&2
-    fi
-  fi
-  exit "$exit_code"
-}
-trap stop_vast_instance EXIT
+To recover the original v1 script for historical reference:
 
-run_one() {
-  local mode="$1"
-  local seed="$2"
-  local run_dir="$SUITE_DIR/${mode}-seed-${seed}"
-  local summary_path="$run_dir/summary.json"
-  local checkpoint_path="$run_dir/checkpoint.pt"
-  local resume_args=()
+    git show exp/night-suite-harness:run_suite.sh
+MESSAGE
 
-  if [[ -f "$summary_path" ]]; then
-    echo "Already complete: $mode seed $seed"
-    return
-  fi
-  if [[ -f "$checkpoint_path" ]]; then
-    echo "Resuming: $mode seed $seed"
-    resume_args+=(--resume "$checkpoint_path")
-  fi
-
-  mkdir -p "$run_dir"
-  bash run.sh "$mode" "$seed" "$run_dir" "${resume_args[@]}" \
-    2>&1 | tee -a "$run_dir/stdout.log"
-}
-
-echo "suite_id=$SUITE_ID"
-echo "suite_dir=$SUITE_DIR"
-
-run_one proxy 0
-run_one proxy 1
-run_one proxy 2
-run_one full 0
-
-python summarize_suite.py "$SUITE_DIR" | tee "$SUITE_DIR/statistics.log"
-echo "Suite complete: $SUITE_DIR"
+exit 64

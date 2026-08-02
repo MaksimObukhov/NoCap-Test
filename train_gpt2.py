@@ -5,6 +5,8 @@ import math
 import glob
 import json
 import random
+import hashlib
+import statistics
 import subprocess
 from dataclasses import dataclass
 
@@ -98,12 +100,31 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+def mlp_hidden_width(config):
+    """Leading MLP width for a given expansion ratio.
+
+    Ratios are exact multiples of n_embd in every configuration used so far
+    (4.0 -> 3072, 3.0 -> 2304 at n_embd 768), so a non-integer product is a
+    configuration error rather than something to silently round.
+    """
+    product = config.mlp_ratio * config.n_embd
+    width = int(round(product))
+    if abs(product - width) > 1e-9:
+        raise ValueError(
+            f"mlp_ratio {config.mlp_ratio} does not give an integer hidden "
+            f"width at n_embd {config.n_embd}"
+        )
+    return width
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
+        hidden_width = mlp_hidden_width(config)
+        self.hidden_width = hidden_width
+        self.c_fc = nn.Linear(config.n_embd, hidden_width, bias=False)
+        self.c_proj = nn.Linear(hidden_width, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -136,6 +157,10 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    # Leading MLP expansion ratio. 4.0 is the frozen baseline; 3.0 is the
+    # exp007/exp012 narrowed stack. Kept as a config field rather than a
+    # literal so the control and the treatment run the same source file.
+    mlp_ratio: float = 4.0
 
 
 class GPT(nn.Module):
@@ -304,6 +329,77 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+# -----------------------------------------------------------------------------
+# Tripwires. These exist so an unattended overnight suite stops a doomed stage
+# instead of paying for it. Distinct exit codes let the orchestrator record the
+# reason without parsing stdout.
+
+EXIT_NONFINITE = 3
+EXIT_ENVELOPE = 4
+EXIT_NO_FINAL_CHECKPOINT = 5
+
+
+def parse_validation_envelope(spec):
+    """Parse a validation-loss envelope into a sorted list of (tokens, limit).
+
+    Accepts a JSON list of [tokens, max_val_loss] pairs, or "@path" pointing
+    at a file holding one. An empty spec disables the tripwire.
+    """
+    if not spec:
+        return []
+    if spec.startswith("@"):
+        with open(spec[1:]) as handle:
+            raw = json.load(handle)
+    else:
+        raw = json.loads(spec)
+    points = []
+    for entry in raw:
+        tokens, limit = entry
+        points.append((int(tokens), float(limit)))
+    points.sort()
+    if not points:
+        return []
+    return points
+
+
+def envelope_limit_at(points, tokens):
+    """Linearly interpolate the envelope; clamp outside the provided range.
+
+    Returns None when no envelope is configured, which callers treat as
+    "tripwire disabled" rather than "limit of zero".
+    """
+    if not points:
+        return None
+    if tokens <= points[0][0]:
+        return points[0][1]
+    if tokens >= points[-1][0]:
+        return points[-1][1]
+    for index in range(1, len(points)):
+        left_tokens, left_limit = points[index - 1]
+        right_tokens, right_limit = points[index]
+        if tokens <= right_tokens:
+            span = right_tokens - left_tokens
+            if span <= 0:
+                return right_limit
+            weight = (tokens - left_tokens) / span
+            return left_limit + weight * (right_limit - left_limit)
+    return points[-1][1]
+
+
+def training_phase(tokens, warmup_tokens, target_tokens, warmdown_tokens):
+    """Schedule phase for the token clock, reported per update.
+
+    Health statistics are aggregated per phase and never pooled: pooling a
+    calm steady state with a noisy warmup is what produced the exp015 false
+    kill in the v2 suite.
+    """
+    if tokens < warmup_tokens:
+        return "warmup"
+    if tokens < target_tokens - warmdown_tokens:
+        return "steady"
+    return "warmdown"
+
+
 if __name__ == "__main__":
     import argparse
     import time
@@ -417,6 +513,42 @@ if __name__ == "__main__":
         help="warmdown tokens expressed as updates at the final effective batch",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument(
+        "--mlp_ratio",
+        type=float,
+        default=4.0,
+        help="leading MLP expansion ratio; 4.0 baseline, 3.0 narrowed stack",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=0.0,
+        help="global gradient-norm clip threshold; 0 disables clipping",
+    )
+    # gradient health instrumentation and tripwires
+    parser.add_argument(
+        "--abort_on_nonfinite",
+        action="store_true",
+        help="stop the run when the loss or the global gradient norm is not finite",
+    )
+    parser.add_argument(
+        "--val_envelope",
+        type=str,
+        default="",
+        help=(
+            "JSON list of [tokens, max_val_loss] pairs, or @path to a file "
+            "holding one; validation above the interpolated envelope aborts"
+        ),
+    )
+    parser.add_argument(
+        "--milestone_every",
+        type=int,
+        default=0,
+        help=(
+            "write an immutable milestone checkpoint every N "
+            "final-batch-equivalent updates; 0 disables"
+        ),
+    )
     # evaluation and persistence
     parser.add_argument(
         "--val_loss_every",
@@ -485,6 +617,20 @@ if __name__ == "__main__":
             <= args.grad_accumulation_steps
         ), "batch ramp must grow toward --grad_accumulation_steps"
     assert args.save_every >= 0
+    assert args.milestone_every >= 0
+    assert args.mlp_ratio > 0.0
+    assert args.grad_clip >= 0.0
+    # A proxy or full result is only reconstructible if its final weights
+    # survive. The v2 suite passed this flag to every stage, which is why no
+    # exp012-exp014 final checkpoint exists.
+    if args.skip_final_checkpoint and args.run_mode in {"proxy", "full"}:
+        raise SystemExit(
+            "--skip_final_checkpoint is only valid for disposable stages; "
+            f"run_mode {args.run_mode!r} must retain its final checkpoint"
+        )
+    validation_envelope = parse_validation_envelope(args.val_envelope)
+    if validation_envelope and args.val_loss_every <= 0:
+        raise SystemExit("--val_envelope requires --val_loss_every > 0")
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
     assert args.profile_active_steps > 0
@@ -524,7 +670,22 @@ if __name__ == "__main__":
 
     resume_checkpoint = None
     if args.resume:
-        resume_checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_path = args.resume
+        if os.path.isdir(resume_path):
+            resume_path = os.path.join(resume_path, "checkpoints", "latest.pt")
+        if not os.path.exists(resume_path):
+            raise SystemExit(f"resume checkpoint not found: {resume_path}")
+        # Resuming from a final checkpoint would restart a finished run and
+        # append a second trajectory to its metrics.
+        resume_checkpoint = torch.load(
+            resume_path, map_location="cpu", weights_only=False
+        )
+        if resume_checkpoint.get("is_final"):
+            raise SystemExit(
+                f"{resume_path} is a final checkpoint; the stage is already "
+                "complete and must not be resumed"
+            )
+        print0(f"resuming from {resume_path}")
         resume_keys = (
             "seed",
             "run_mode",
@@ -539,13 +700,18 @@ if __name__ == "__main__":
             "warmup_iters",
             "warmdown_iters",
             "weight_decay",
+            "mlp_ratio",
+            "grad_clip",
         )
         for key in resume_keys:
             if key in {
                 "batch_ramp_start_accumulation_steps",
                 "batch_ramp_fraction",
+                "grad_clip",
             }:
                 checkpoint_value = resume_checkpoint["args"].get(key, 0)
+            elif key == "mlp_ratio":
+                checkpoint_value = resume_checkpoint["args"].get(key, 4.0)
             else:
                 checkpoint_value = resume_checkpoint["args"][key]
             if checkpoint_value != getattr(args, key):
@@ -575,10 +741,13 @@ if __name__ == "__main__":
     }
 
     metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
-    checkpoint_path = os.path.join(args.output_dir, "checkpoint.pt")
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    latest_checkpoint_path = os.path.join(checkpoint_dir, "latest.pt")
+    final_checkpoint_path = os.path.join(checkpoint_dir, "final.pt")
     summary_path = os.path.join(args.output_dir, "summary.json")
     if master_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
         write_json_atomic(
             os.path.join(args.output_dir, "config.json"),
             {"args": vars(args), "metadata": metadata},
@@ -588,6 +757,27 @@ if __name__ == "__main__":
         if resume_checkpoint is None:
             with open(metrics_path, "w"):
                 pass
+        else:
+            # The checkpoint can lag the last written records, so appending
+            # blindly on resume duplicates updates. Drop everything the
+            # checkpoint did not see, keyed on its token cursor.
+            resume_tokens = resume_checkpoint.get("tokens_seen", 0)
+            kept = []
+            with open(metrics_path) as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if record.get("tokens_seen", 0) <= resume_tokens:
+                        kept.append(line)
+            with open(metrics_path, "w") as handle:
+                for line in kept:
+                    handle.write(line + "\n")
+            print0(
+                f"resume: truncated {metrics_path} to {len(kept)} records at "
+                f"or below {resume_tokens:,} tokens"
+            )
 
     def log_local(payload):
         if master_process:
@@ -625,6 +815,7 @@ if __name__ == "__main__":
     warmdown_tokens = args.warmdown_iters * final_tokens_per_update
     validation_interval_tokens = args.val_loss_every * final_tokens_per_update
     save_interval_tokens = args.save_every * final_tokens_per_update
+    milestone_interval_tokens = args.milestone_every * final_tokens_per_update
     ramp_start_accumulation = (
         args.batch_ramp_start_accumulation_steps
         or args.grad_accumulation_steps
@@ -653,13 +844,28 @@ if __name__ == "__main__":
     )
 
     num_vocab = 50257
+    ratio = args.mlp_ratio
     model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
-        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
-        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
-        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
+        "d12": GPTConfig(
+            vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768, mlp_ratio=ratio
+        ),
+        "d24": GPTConfig(
+            vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024, mlp_ratio=ratio
+        ),
+        "d36": GPTConfig(
+            vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280, mlp_ratio=ratio
+        ),
+        "d48": GPTConfig(
+            vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600, mlp_ratio=ratio
+        ),
     }[args.model]
     base_model = GPT(model_config)
+    parameter_count = sum(p.numel() for p in base_model.parameters())
+    print0(
+        f"model: {args.model} | mlp_ratio {ratio} | "
+        f"hidden width {mlp_hidden_width(model_config)} | "
+        f"parameters {parameter_count:,}"
+    )
     if resume_checkpoint is not None:
         base_model.load_state_dict(resume_checkpoint["model"])
     base_model = base_model.train().cuda()
@@ -739,11 +945,41 @@ if __name__ == "__main__":
     def elapsed_wall_seconds():
         return previous_wall_time_seconds + time.perf_counter() - session_wall_start
 
-    def save_checkpoint(next_step):
+    def save_checkpoint(next_step, kind="latest"):
+        """Persist training state.
+
+        Three distinct destinations, deliberately not one rotating file:
+        `latest.pt` is the resume point and is the only one that may be
+        overwritten; `final.pt` is written once at the end and is what makes
+        a proxy result reconstructible; milestones are immutable snapshots
+        for later checkpoint averaging.
+        """
         if not master_process:
-            return
+            return None
+        if kind == "final":
+            destination = final_checkpoint_path
+        elif kind == "milestone":
+            destination = os.path.join(
+                checkpoint_dir, f"milestone-step{next_step:06d}.pt"
+            )
+        elif kind == "latest":
+            destination = latest_checkpoint_path
+        else:
+            raise ValueError(f"unknown checkpoint kind {kind!r}")
+        # Structural guard, asserted rather than assumed: the rotating
+        # checkpoint must never be able to land on the final one.
+        if kind != "final" and os.path.abspath(destination) == os.path.abspath(
+            final_checkpoint_path
+        ):
+            raise RuntimeError(
+                f"{kind} checkpoint would overwrite the final checkpoint"
+            )
+        if kind == "milestone" and os.path.exists(destination):
+            # Milestones are immutable; a repeat write means a step collision.
+            print0(f"milestone already exists, not rewriting: {destination}")
+            return destination
         checkpoint = {
-            "version": 2,
+            "version": 3,
             "run_id": run_id,
             "wandb_run_id": wandb_run_id,
             "model": base_model.state_dict(),
@@ -767,11 +1003,18 @@ if __name__ == "__main__":
             "args": vars(args),
             "metadata": metadata,
             "code": code,
+            "kind": kind,
+            "target_tokens": target_tokens,
+            "is_final": kind == "final",
         }
-        temporary_path = f"{checkpoint_path}.tmp"
+        temporary_path = f"{destination}.tmp"
         torch.save(checkpoint, temporary_path)
-        os.replace(temporary_path, checkpoint_path)
-        print0(f"saved checkpoint: {checkpoint_path} (next step {next_step})")
+        os.replace(temporary_path, destination)
+        print0(
+            f"saved {kind} checkpoint: {destination} "
+            f"(next step {next_step}, {tokens_seen:,} tokens)"
+        )
+        return destination
 
     profiler = None
     if args.profile:
@@ -817,6 +1060,76 @@ if __name__ == "__main__":
             f"active={args.profile_active_steps}"
         )
 
+    phase_grad_norms = {}
+    phase_clip_activations = {}
+
+    def gradient_health_by_phase():
+        """Per-phase gradient statistics, reported but never used as a gate.
+
+        Kept separate by phase on purpose. The v2 health gate pooled warmup
+        and steady state into one median, which put its spike threshold at
+        10x a number dominated by the calm phase and produced a false kill.
+        """
+        report = {}
+        for name, values in sorted(phase_grad_norms.items()):
+            if not values:
+                continue
+            ordered = sorted(values)
+            report[name] = {
+                "updates": len(values),
+                "median": statistics.median(values),
+                "p90": ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))],
+                "max": ordered[-1],
+                "clip_activations": phase_clip_activations.get(name, 0),
+            }
+        return report
+
+    def abort_stage(reason, code, detail):
+        """Stop a doomed stage, leaving a complete local record behind.
+
+        An aborted stage still writes summary.json, so the orchestrator can
+        tell "tripwire fired" apart from "process vanished" without parsing
+        stdout.
+        """
+        print0(f"ABORT [{reason}]: {detail}")
+        log_local(
+            {
+                "event": "abort",
+                "reason": reason,
+                "detail": detail,
+                "step": completed_steps,
+                "tokens_seen": tokens_seen,
+                "training_time_seconds": training_time_ms / 1000,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+        )
+        if master_process:
+            aborted_summary = {
+                "status": f"aborted-{reason}",
+                "abort_reason": reason,
+                "abort_detail": detail,
+                "run_id": run_id,
+                "run_name": args.run_name,
+                "run_mode": args.run_mode,
+                "seed": args.seed,
+                "git_commit": git_commit,
+                "git_dirty": git_dirty,
+                "gpu_name": metadata["gpu_name"],
+                "final_val_loss": final_val_loss,
+                "num_iterations": args.num_iterations,
+                "optimizer_updates": completed_steps,
+                "target_tokens": target_tokens,
+                "tokens_seen": tokens_seen,
+                "training_time_seconds": training_time_ms / 1000,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+            write_json_atomic(summary_path, aborted_summary)
+            if wandb_run is not None:
+                wandb_run.summary.update(aborted_summary)
+                wandb_run.finish(exit_code=code)
+        destroy_process_group()
+        sys.exit(code)
+
     while True:
         assert tokens_seen <= target_tokens
         last_step = tokens_seen == target_tokens
@@ -842,11 +1155,13 @@ if __name__ == "__main__":
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
             final_val_loss = val_loss.item()
+            envelope_limit = envelope_limit_at(validation_envelope, tokens_seen)
             validation_record = {
                 "event": "validation",
                 "step": completed_steps,
                 "tokens_seen": tokens_seen,
                 "val_loss": final_val_loss,
+                "val_envelope_limit": envelope_limit,
                 "training_time_seconds": training_time_ms / 1000,
                 "wall_time_seconds": elapsed_wall_seconds(),
             }
@@ -858,6 +1173,19 @@ if __name__ == "__main__":
             if wandb_run is not None:
                 wandb_run.log(validation_record)
             last_validation_tokens = tokens_seen
+            if not math.isfinite(final_val_loss) and args.abort_on_nonfinite:
+                abort_stage(
+                    "nonfinite",
+                    EXIT_NONFINITE,
+                    f"validation loss is {final_val_loss}",
+                )
+            if envelope_limit is not None and final_val_loss > envelope_limit:
+                abort_stage(
+                    "envelope",
+                    EXIT_ENVELOPE,
+                    f"validation {final_val_loss:.6f} exceeds envelope "
+                    f"{envelope_limit:.6f} at {tokens_seen:,} tokens",
+                )
 
         if last_step:
             break
@@ -896,6 +1224,37 @@ if __name__ == "__main__":
         lr = base_lr * lr_batch_scale
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+        # The global gradient norm serves both the clipping decision and the
+        # non-finite tripwire, so it is computed on every update when either
+        # is active -- roughly 0.5 ms against a multi-second step. When
+        # neither is active it is skipped entirely, so benchmark stages carry
+        # exactly the same work as the recorded v2 measurements and remain
+        # comparable to them. With clipping off but the tripwire on, max_norm
+        # is infinite: clip_grad_norm_ returns the norm and scales nothing.
+        need_grad_norm = args.grad_clip > 0 or args.abort_on_nonfinite
+        if need_grad_norm:
+            clip_threshold = args.grad_clip if args.grad_clip > 0 else float("inf")
+            pre_clip_grad_norm = torch.nn.utils.clip_grad_norm_(
+                base_model.parameters(),
+                clip_threshold,
+                error_if_nonfinite=False,
+            ).item()
+            grad_norm_finite = math.isfinite(pre_clip_grad_norm)
+            clip_activated = (
+                args.grad_clip > 0
+                and grad_norm_finite
+                and pre_clip_grad_norm > args.grad_clip
+            )
+            clip_coefficient = (
+                min(1.0, args.grad_clip / (pre_clip_grad_norm + 1e-6))
+                if args.grad_clip > 0 and grad_norm_finite
+                else 1.0
+            )
+        else:
+            pre_clip_grad_norm = None
+            grad_norm_finite = True
+            clip_activated = False
+            clip_coefficient = 1.0
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
@@ -907,6 +1266,9 @@ if __name__ == "__main__":
         previous_tokens_seen = tokens_seen
         tokens_seen += update_tokens
         completed_steps += 1
+        phase = training_phase(
+            previous_tokens_seen, warmup_tokens, target_tokens, warmdown_tokens
+        )
         train_record = {
             "event": "train",
             "step": completed_steps,
@@ -921,7 +1283,18 @@ if __name__ == "__main__":
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
+            # Gradient health, carried on every update and tagged by schedule
+            # phase so warmup transients are never pooled with steady state.
+            "phase": phase,
+            "pre_clip_grad_norm": pre_clip_grad_norm,
+            "grad_clip_threshold": args.grad_clip,
+            "grad_clip_activated": clip_activated,
+            "grad_clip_coefficient": clip_coefficient,
         }
+        if pre_clip_grad_norm is not None:
+            phase_grad_norms.setdefault(phase, []).append(pre_clip_grad_norm)
+        if clip_activated:
+            phase_clip_activations[phase] = phase_clip_activations.get(phase, 0) + 1
         print0(
             f"update:{completed_steps} | tokens:{tokens_seen:,}/{target_tokens:,} | "
             f"batch:{update_tokens:,} | loss {lossf:.6f} | lr:{lr:.6g} | "
@@ -931,13 +1304,29 @@ if __name__ == "__main__":
         if wandb_run is not None:
             wandb_run.log(train_record)
 
+        if args.abort_on_nonfinite and not (
+            math.isfinite(lossf) and grad_norm_finite
+        ):
+            abort_stage(
+                "nonfinite",
+                EXIT_NONFINITE,
+                f"loss {lossf}, pre-clip gradient norm {pre_clip_grad_norm}",
+            )
+
         crossed_save_boundary = (
             args.save_every > 0
             and tokens_seen // save_interval_tokens
             > previous_tokens_seen // save_interval_tokens
         )
         if crossed_save_boundary:
-            save_checkpoint(completed_steps)
+            save_checkpoint(completed_steps, kind="latest")
+        crossed_milestone_boundary = (
+            args.milestone_every > 0
+            and tokens_seen // milestone_interval_tokens
+            > previous_tokens_seen // milestone_interval_tokens
+        )
+        if crossed_milestone_boundary:
+            save_checkpoint(completed_steps, kind="milestone")
 
         if profiler is not None:
             # One profiler step is one complete optimizer update, including accumulation.
@@ -966,8 +1355,19 @@ if __name__ == "__main__":
         "wall_time_seconds": elapsed_wall_seconds(),
         "tokens_per_second": tokens_seen / training_time_seconds,
         "peak_memory_mib": peak_memory_mib,
+        "parameter_count": parameter_count,
+        "mlp_ratio": args.mlp_ratio,
+        "mlp_hidden_width": mlp_hidden_width(model_config),
+        "grad_clip_threshold": args.grad_clip,
+        "gradient_health_by_phase": gradient_health_by_phase(),
     }
     print0(f"peak memory consumption: {peak_memory_mib} MiB")
+    for phase_name, stats in summary["gradient_health_by_phase"].items():
+        print0(
+            f"grad health [{phase_name}]: n={stats['updates']} "
+            f"median={stats['median']:.4f} p90={stats['p90']:.4f} "
+            f"max={stats['max']:.4f} clipped={stats['clip_activations']}"
+        )
     final_val_text = "n/a" if final_val_loss is None else f"{final_val_loss:.6f}"
     print0(
         f"final val loss: {final_val_text} | tokens: {tokens_seen:,} | "
@@ -976,9 +1376,32 @@ if __name__ == "__main__":
         f"throughput: {summary['tokens_per_second']:,.0f} tok/s"
     )
 
+    final_checkpoint_missing = False
     if master_process:
         if not args.skip_final_checkpoint:
-            save_checkpoint(completed_steps)
+            save_checkpoint(completed_steps, kind="final")
+            if os.path.exists(final_checkpoint_path):
+                digest = hashlib.sha256()
+                with open(final_checkpoint_path, "rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(block)
+                summary["final_checkpoint"] = {
+                    "path": final_checkpoint_path,
+                    "sha256": digest.hexdigest(),
+                    "bytes": os.path.getsize(final_checkpoint_path),
+                    "next_step": completed_steps,
+                    "tokens_seen": tokens_seen,
+                }
+                print0(
+                    f"final checkpoint sha256 "
+                    f"{summary['final_checkpoint']['sha256']}"
+                )
+            else:
+                final_checkpoint_missing = True
+        # A proxy or full stage without retained final weights is not a
+        # result, it is an unreproducible number. Refuse to call it complete.
+        if final_checkpoint_missing and args.run_mode in {"proxy", "full"}:
+            summary["status"] = "incomplete-no-final-checkpoint"
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)
@@ -986,3 +1409,9 @@ if __name__ == "__main__":
             wandb_run.finish()
 
     destroy_process_group()
+    if final_checkpoint_missing and args.run_mode in {"proxy", "full"}:
+        print0(
+            f"ERROR: {args.run_mode} stage produced no final checkpoint at "
+            f"{final_checkpoint_path}"
+        )
+        sys.exit(EXIT_NO_FINAL_CHECKPOINT)
