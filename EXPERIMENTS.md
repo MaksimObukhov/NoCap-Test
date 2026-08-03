@@ -113,7 +113,7 @@ proposal's cost but does not predict a loss improvement.
 | exp013 | completed proxy s0, null result | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | 3.597677, delta -0.000096 vs baseline s0 (-0.05 sigma, exact null); systems speedup +0.34%, `aten::mm` time unchanged (-0.5%) | No loss/token or systems benefit; the GELU activation kernel is already fully fused by Inductor, so the model stays GEMM-bound. Close the hypothesis; do not run seeds 1/2 |
 | exp014 | completed proxy s0, killed | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | 3.624233, delta +0.026460 vs baseline s0 (+14.7 sigma), +0.007872 worse than exp007 uniform 3D (+4.4 sigma); benchmark +0.17% vs uniform-3D control | Killed by the pre-registered proxy gate. Per-layer gradient RMS at update 256 shows the allocation prior was backwards: layers 8-11 (given 3.5D) have below-average grad RMS while layers 0-3 (given 2.5D) have 5-8x the mean. Do not run seeds 1/2 |
 | exp015 | health-killed, kill contested | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Health diagnostic killed on 3 gradient spikes and 2 loss spikes (pool median over warmup+post-warmup); benchmark -1.225% vs uniform-3D control, within the -2% threshold; proxy never ran | All spikes (updates 80, 86, 88) fall inside the 96-update warmup and fully recover within one update; post-warmup max grad norm (1.92) is in line with exp012-014. The pooled-median health gate conflates warmup transients with steady-state instability. See exp015 Results below for the reanalysis and the reopening condition |
-| exp016 | attempted v3/v4, infrastructure-invalid | Descent-Budgeted Multi-Directional AdamW on attention-V updates | No scientific result: v3 rejected the legacy checkpoint schema; v4 then stopped because the captured baseline source was not copied beside the remote checkpoint | The checkpoints and captured source now exist locally. Reconcile their pinned hashes, stage all three files together, and rerun A before B or C |
+| exp016 | completed A, mechanism killed | Descent-Budgeted Multi-Directional AdamW on attention-V updates | Exact frozen-weight replay passed provenance, immutability, descent, norm, activity, and positive-descent checks, but median functional leading-energy reduction was only 0.6456% at the proxy checkpoint and 1.7315% at full versus the registered 10% minimum | Scientific kill at A; B and C were correctly skipped. The 1% descent budget makes the treatment safe but too weak to materially change functional concentration |
 | exp017 | completed proxy s0, inconclusive | Selective weight decay: exempt only the tied `wte`/`lm_head` matrix from WD 0.1, on the full exp012 stack | Accounting passed; 3.580403, delta -0.001520 vs exp012 (-0.85 sigma); 937,426,944 tokens and 2,549 optimizer updates | Inside the pre-registered inconclusive band. Do not promote or rerun alone; retain as a possible interaction term for a future small-batch combination |
 | exp018 | completed forward feasibility measurement, pass | FP8 compute path for the `lm_head` vocab projection | BF16 forward median 10.724 ms vs FP8 cast+GEMM 4.572 ms; forward-only projected full-step gain 5.28% on RTX 4090 | Authorises a separate integration benchmark only after the architecture winner. Backward, tied-weight integration, padded-vocabulary masking and training quality remain unvalidated |
 | exp019 | attempted v3, infrastructure-invalid | Fused 2D SwiGLU (one `Linear(768->3072)` + `chunk(2)`) plus the exact exp012 batch ramp, with gradient clipping at 10 | Accounting passed at 109,376,256 parameters and exact fused/reference equivalence; treatment benchmark failed before training because its validation path remained relative | No systems or proxy result. Retry later with absolute train and validation globs; this remains the next architecture candidate if exp021 does not justify a new combination |
@@ -1473,8 +1473,8 @@ pathology is now measured and specific to this architecture.
 
 ## exp016 — Descent-Budgeted Multi-Directional AdamW
 
-**Status:** planned staged gate. A proxy is conditional on A and B passing; no
-full run is authorised by this row.
+**Status:** completed A on 3 August 2026; mechanism killed. B and C were not
+run, as required by the staged gate.
 
 **Treatment.** For each attention-V AdamW-preconditioned direction `P`, estimate
 the leading two singular triplets and define
@@ -1621,6 +1621,28 @@ immutable input manifest covering all three SHA-256 values and stage them as a
 single unit. Then rerun A unchanged and continue to B/C only through the
 already registered gates. W&B failure artifact:
 https://wandb.ai/m-obukhov-home/nocap-baseline/runs/rkqpr1ew
+
+**v5 causal result.** Commit
+`fc4d9df58e86fac22231c0a9350339bd124f76af` reran A on one RTX 4090 after an
+immutable input manifest validated both exact checkpoint hashes, both captured
+source hashes, all 50 FineWeb train shards (5B tokens), and the validation
+shard. The worktree was clean, the synthetic self-test passed, and parameters
+remained bitwise unchanged for both frozen-weight replays. Each checkpoint
+produced 96 layer/update records over eight exact effective batches.
+
+| Checkpoint | Descent retention median | Norm retention median | Active fraction | Functional leading-energy reduction median | A decision |
+|---|---:|---:|---:|---:|---|
+| exp000 proxy | 0.990000 | 0.994261 | 100% | 0.006456 (0.6456%) | kill |
+| exp000 full | 0.990000 | 0.995018 | 100% | 0.017315 (1.7315%) | kill |
+
+The treatment passed every registered check except the required functional
+reduction of at least 10%. Observed reductions were 0.24-2.29% across proxy
+records and 0.79-3.31% across full records. Thus the descent constraint behaved
+exactly as intended, but the alpha permitted by a 1% first-order descent budget
+was too small to materially flatten the dominant functional mode. This is a
+valid scientific negative result rather than another infrastructure failure.
+The launcher reported `A=kill` and intentionally skipped B; do not run the
+systems benchmark, health diagnostic, or proxy for this formulation.
 
 ## exp017 — selective no-weight-decay on the tied embedding
 
