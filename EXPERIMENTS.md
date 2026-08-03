@@ -121,7 +121,7 @@ proposal's cost but does not predict a loss improvement.
 | exp021 | completed proxy and full s0, full target miss | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | Proxy 3.567184; full 3.387356 at 2,700,083,200 tokens in 19,500.15 s training / 19,966.26 s wall time; observed 138,465 tok/s | The full missed the 3.3821 target by 0.005256 despite 8.01% more tokens than baseline. The early advantage vanished near 1.1B tokens; do not rerun this schedule unchanged |
 | exp022 | completed proxy s0, killed | On the exact exp021 schedule combine fused 2D SwiGLU, global clip 10, and selective no-WD for the tied embedding/head | 3.607177, +0.039993 worse than exp021; 1.52% more training time and 1.50% lower throughput; clip 10 never activated | Failed both winner routes. Do not run full or promote SwiGLU/selective-no-WD on this stack; the joint run cannot attribute the loss regression between its additions |
 | exp023 | attempted integration benchmark, infrastructure-invalid | FP8 compute only for the padded tied lm_head of the selected exp021 architecture | No benchmark result: the runner rejected the valid `exp021` winner before measurement; TorchAO also emitted binary-load warnings | Fix winner transport and the pinned TorchAO runtime, then repeat the isolated integration benchmark after the final architecture is selected. No FP8 quality or speed claim exists yet |
-| exp024 | planned direct full s0 | Uniform 3D GELU MLP with an absolute-token staircase batch schedule 64K -> 128K -> 256K -> 524K; fixed 524K LR reference | Awaiting one 2,700,083,200-token full. The switch to 524K is fixed at 939,524,096 tokens, before exp021's full loss advantage disappears | Deliberate exception to the proxy funnel: the decisive transition lies beyond the standard 937,426,944-token proxy. This is the final algorithmic full candidate; no paid launch is authorised by documentation alone |
+| exp024 | implementation ready; full s0 authorised | Uniform 3D GELU MLP with an absolute-token staircase batch schedule 64K -> 128K -> 256K -> 524K; fixed 524K LR reference | Branch `exp024/staircase-batch-ramp` at `9e86007` freezes one 2,700,083,200-token full; the switch to 524K is fixed at 939,524,096 tokens | Max authorised the direct paid full on 3 August 2026. Run once with W&B; do not tune boundaries or launch another algorithmic full afterward if it fails |
 
 ## Completed experiments
 
@@ -2107,8 +2107,8 @@ complete production forward/backward path before considering any FP8 full.
 ## exp024 — absolute-token staircase batch schedule on uniform 3D
 
 **Status:** pre-registered on 3 August 2026 from the completed exp021 full
-curve. One direct BF16 full seed-0 run is proposed; this documentation does not
-authorise paid compute. No FP8 treatment is part of exp024.
+curve. Implementation `9e86007` is ready and Max subsequently authorised one
+direct BF16 full seed-0 run. No FP8 treatment is part of exp024.
 
 **Question.** exp021's horizon-scaled 16K-to-256K ramp created a large early
 loss advantage but kept increasing the batch too slowly. Against the baseline
@@ -2173,6 +2173,15 @@ spikes separately. Save immutable checkpoints at all three phase boundaries,
 the final checkpoint, and the last 8-10 warmdown milestones. Abort only on
 non-finite loss/gradient or an infrastructure/provenance failure; do not tune a
 boundary during the run.
+
+**Implementation.** Branch `exp024/staircase-batch-ramp`, commit `9e86007`,
+uses a 262,144-token clock to preserve exp021's exact warmup, warmdown,
+validation, save and milestone spans while allowing the final effective batch
+to be 524,288. Local accounting verifies 10,270 optimizer updates, exact phase
+boundaries and 109,376,256 parameters. The launcher accepts only full seed 0,
+requires online W&B logging, creates a hashed 50-shard dataset manifest before
+training, saves immutable phase and warmdown checkpoints, and uploads the final
+checkpoint as a W&B artifact.
 
 **Pre-registered interpretation.** Primary success is validation loss at most
 `3.3821`, with time-to-target compared against the same baseline timing
