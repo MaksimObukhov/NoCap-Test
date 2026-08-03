@@ -84,7 +84,14 @@ def validate_checkpoint(
     actual_commit = str(checkpoint.get("metadata", {}).get("git_commit", ""))
     if not actual_commit.startswith(expected_commit):
         errors.append(f"unexpected checkpoint commit: {actual_commit}")
-    for key in ("model", "optimizer", "next_x", "next_y", "train_loader"):
+    for key in (
+        "model",
+        "optimizer",
+        "next_x",
+        "next_y",
+        "train_loader",
+        "rng_state",
+    ):
         if key not in checkpoint:
             errors.append(f"missing checkpoint key: {key}")
     next_step = checkpoint.get("next_step")
@@ -343,8 +350,8 @@ def analyze_checkpoint(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", action="append", type=parse_checkpoint_spec)
-    parser.add_argument("--input-bin", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--input-bin")
+    parser.add_argument("--output")
     parser.add_argument("--num-updates", type=int, default=8)
     parser.add_argument("--sample-rows", type=int, default=2048)
     parser.add_argument("--power-iterations", type=int, default=8)
@@ -355,6 +362,8 @@ def main():
         synthetic_self_test()
         print("exp016-A self-test passed")
         return
+    if not args.input_bin or not args.output:
+        parser.error("--input-bin and --output are required unless --self-test is used")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if not args.checkpoint or [item[0] for item in args.checkpoint] != ["proxy", "full"]:

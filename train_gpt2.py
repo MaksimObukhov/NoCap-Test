@@ -14,6 +14,10 @@ from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
+from descent_budgeted_adamw import (
+    AttentionVDescentBudgetedCap,
+    aggregate_diagnostics,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -399,6 +403,18 @@ if __name__ == "__main__":
         help="learning rate warmdown iterations",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument(
+        "--descent_budgeted_attn_v",
+        action="store_true",
+        help="apply exp016 descent-budgeted reweighting to attention-V updates",
+    )
+    parser.add_argument("--spectral_bootstrap_iters", type=int, default=4)
+    parser.add_argument("--spectral_tracking_iters", type=int, default=1)
+    parser.add_argument(
+        "--skip_final_checkpoint",
+        action="store_true",
+        help="skip the final checkpoint for disposable benchmark stages",
+    )
     # evaluation and persistence
     parser.add_argument(
         "--val_loss_every",
@@ -448,6 +464,8 @@ if __name__ == "__main__":
     assert args.num_iterations > 0
     assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
     assert args.save_every >= 0
+    assert args.spectral_bootstrap_iters > 0
+    assert args.spectral_tracking_iters > 0
     assert args.profile_wait_steps >= 0
     assert args.profile_warmup_steps >= 0
     assert args.profile_active_steps > 0
@@ -495,6 +513,9 @@ if __name__ == "__main__":
             "warmup_iters",
             "warmdown_iters",
             "weight_decay",
+            "descent_budgeted_attn_v",
+            "spectral_bootstrap_iters",
+            "spectral_tracking_iters",
         )
         for key in resume_keys:
             if resume_checkpoint["args"][key] != getattr(args, key):
@@ -534,6 +555,12 @@ if __name__ == "__main__":
         )
         with open(os.path.join(args.output_dir, "train_gpt2.py"), "w") as f:
             f.write(code)
+        if args.descent_budgeted_attn_v:
+            with open("descent_budgeted_adamw.py") as source:
+                with open(
+                    os.path.join(args.output_dir, "descent_budgeted_adamw.py"), "w"
+                ) as target:
+                    target.write(source.read())
         if resume_checkpoint is None:
             with open(metrics_path, "w"):
                 pass
@@ -624,6 +651,16 @@ if __name__ == "__main__":
         print0(f"resuming from completed step {start_step}")
     else:
         x, y = train_loader.next_batch()
+
+    spectral_treatment = None
+    spectral_last_record = None
+    if args.descent_budgeted_attn_v:
+        spectral_treatment = AttentionVDescentBudgetedCap(
+            base_model,
+            optimizer,
+            bootstrap_iterations=args.spectral_bootstrap_iters,
+            tracking_iterations=args.spectral_tracking_iters,
+        )
 
     def get_lr(it):
         assert it < args.num_iterations
@@ -766,7 +803,13 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+        spectral_record = {}
+        if spectral_treatment is not None:
+            spectral_record = aggregate_diagnostics(spectral_treatment.prepare())
         optimizer.step()
+        if spectral_treatment is not None:
+            spectral_treatment.apply()
+            spectral_last_record = {"step": step + 1, **spectral_record}
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         step_time_ms = 1000 * (time.perf_counter() - train_step_start)
@@ -786,6 +829,7 @@ if __name__ == "__main__":
             "training_time_seconds": training_time_ms / 1000,
             "tokens_per_second": tokens_seen / (training_time_ms / 1000),
             "wall_time_seconds": elapsed_wall_seconds(),
+            **spectral_record,
         }
         print0(
             f"step:{completed_steps}/{args.num_iterations} | loss {lossf:.6f} | "
@@ -825,6 +869,8 @@ if __name__ == "__main__":
         "wall_time_seconds": elapsed_wall_seconds(),
         "tokens_per_second": total_tokens / training_time_seconds,
         "peak_memory_mib": peak_memory_mib,
+        "descent_budgeted_attn_v": args.descent_budgeted_attn_v,
+        "spectral_last_record": spectral_last_record,
     }
     print0(f"peak memory consumption: {peak_memory_mib} MiB")
     final_val_text = "n/a" if final_val_loss is None else f"{final_val_loss:.6f}"
@@ -835,7 +881,8 @@ if __name__ == "__main__":
     )
 
     if master_process:
-        save_checkpoint(args.num_iterations)
+        if not args.skip_final_checkpoint:
+            save_checkpoint(args.num_iterations)
         write_json_atomic(summary_path, summary)
         if wandb_run is not None:
             wandb_run.summary.update(summary)

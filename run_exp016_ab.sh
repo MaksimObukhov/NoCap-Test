@@ -19,6 +19,16 @@ TRAIN_GLOB="$DATA_ROOT/fineweb_train_*.bin"
 VAL_GLOB="$DATA_ROOT/fineweb_val_*.bin"
 A_DIR="$RESULTS_ROOT/exp016/causal-a"
 B_DIR="$RESULTS_ROOT/exp016/systems-b"
+PREFLIGHT_DIR="$RESULTS_ROOT/exp016/preflight"
+
+mkdir -p "$PREFLIGHT_DIR"
+"$PYTHON_BIN" verify_exp016_inputs.py \
+  --checkpoint-root "$CHECKPOINT_ROOT" \
+  --data-root "$DATA_ROOT" \
+  --output "$PREFLIGHT_DIR/input_manifest.json" \
+  2>&1 | tee "$PREFLIGHT_DIR/input_manifest.log"
+"$PYTHON_BIN" analyze_exp016_a.py --self-test \
+  2>&1 | tee "$PREFLIGHT_DIR/causal_self_test.log"
 
 mkdir -p "$A_DIR"
 "$PYTHON_BIN" analyze_exp016_a.py \
@@ -41,3 +51,6 @@ export TORCHINDUCTOR_CACHE_DIR="$RESULTS_ROOT/compile-cache/exp016-b"
   --input-bin "$TRAIN_GLOB" \
   --input-val-bin "$VAL_GLOB" \
   2>&1 | tee "$B_DIR/stdout.log"
+
+B_DECISION="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' "$B_DIR/summary.json")"
+echo "exp016 complete: A=$A_DECISION B=$B_DECISION"
