@@ -78,12 +78,15 @@ def write_json_atomic(path, payload):
 
 def git_metadata():
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    branch = subprocess.check_output(
+        ["git", "branch", "--show-current"], text=True
+    ).strip()
     dirty = subprocess.call(["git", "diff", "--quiet"]) != 0 or subprocess.call(
         ["git", "diff", "--cached", "--quiet"]
     ) != 0
     if dirty:
         raise ValueError("tracked worktree changes invalidate the input manifest")
-    return {"commit": commit, "tracked_dirty": False}
+    return {"branch": branch, "commit": commit, "tracked_dirty": False}
 
 
 def main():
@@ -169,6 +172,14 @@ def main():
     payload = {
         "experiment": "exp016-input-manifest-v5",
         "status": "valid",
+        "run_plan": {
+            "experiment": "exp016",
+            "treatment": "descent-budgeted spectral reweighting of attention-V AdamW updates",
+            "launcher": "run_exp016_ab.sh",
+            "stages": ["causal-a", "systems-b-if-a-passes"],
+            "seed": 0,
+            "automatic_paid_training": False,
+        },
         "source": git_metadata(),
         "checkpoint_root": str(checkpoint_root),
         "data_root": str(data_root),
