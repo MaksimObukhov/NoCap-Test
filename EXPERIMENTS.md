@@ -113,14 +113,15 @@ proposal's cost but does not predict a loss improvement.
 | exp013 | completed proxy s0, null result | Replace GELU with squared ReLU in the otherwise unchanged 4D MLP | 3.597677, delta -0.000096 vs baseline s0 (-0.05 sigma, exact null); systems speedup +0.34%, `aten::mm` time unchanged (-0.5%) | No loss/token or systems benefit; the GELU activation kernel is already fully fused by Inductor, so the model stays GEMM-bound. Close the hypothesis; do not run seeds 1/2 |
 | exp014 | completed proxy s0, killed | Depth-shaped MLP: 2.5D in layers 0–3, 3D in 4–7, 3.5D in 8–11 | 3.624233, delta +0.026460 vs baseline s0 (+14.7 sigma), +0.007872 worse than exp007 uniform 3D (+4.4 sigma); benchmark +0.17% vs uniform-3D control | Killed by the pre-registered proxy gate. Per-layer gradient RMS at update 256 shows the allocation prior was backwards: layers 8-11 (given 3.5D) have below-average grad RMS while layers 0-3 (given 2.5D) have 5-8x the mean. Do not run seeds 1/2 |
 | exp015 | health-killed, kill contested | Replace the 3D GELU MLP with a 2D SwiGLU MLP at equal leading MLP parameters/FLOPs | Health diagnostic killed on 3 gradient spikes and 2 loss spikes (pool median over warmup+post-warmup); benchmark -1.225% vs uniform-3D control, within the -2% threshold; proxy never ran | All spikes (updates 80, 86, 88) fall inside the 96-update warmup and fully recover within one update; post-warmup max grad norm (1.92) is in line with exp012-014. The pooled-median health gate conflates warmup transients with steady-state instability. See exp015 Results below for the reanalysis and the reopening condition |
-| exp016 | attempted v3, infrastructure-invalid | Descent-Budgeted Multi-Directional AdamW on attention-V updates | No scientific result: checkpoint validation stopped because the legacy exp000 checkpoints omit an explicit `tokens_seen` field | The token counts are exactly derivable from the pinned `next_step` values and 524,288 tokens/update, but the pre-registered validator required a stored field. Amend the validator only for the exact pinned legacy hashes/schema, then rerun A before B or C |
+| exp016 | attempted v3/v4, infrastructure-invalid | Descent-Budgeted Multi-Directional AdamW on attention-V updates | No scientific result: v3 rejected the legacy checkpoint schema; v4 then stopped because the captured baseline source was not copied beside the remote checkpoint | The checkpoints and captured source now exist locally. Reconcile their pinned hashes, stage all three files together, and rerun A before B or C |
 | exp017 | completed proxy s0, inconclusive | Selective weight decay: exempt only the tied `wte`/`lm_head` matrix from WD 0.1, on the full exp012 stack | Accounting passed; 3.580403, delta -0.001520 vs exp012 (-0.85 sigma); 937,426,944 tokens and 2,549 optimizer updates | Inside the pre-registered inconclusive band. Do not promote or rerun alone; retain as a possible interaction term for a future small-batch combination |
 | exp018 | completed forward feasibility measurement, pass | FP8 compute path for the `lm_head` vocab projection | BF16 forward median 10.724 ms vs FP8 cast+GEMM 4.572 ms; forward-only projected full-step gain 5.28% on RTX 4090 | Authorises a separate integration benchmark only after the architecture winner. Backward, tied-weight integration, padded-vocabulary masking and training quality remain unvalidated |
 | exp019 | attempted v3, infrastructure-invalid | Fused 2D SwiGLU (one `Linear(768->3072)` + `chunk(2)`) plus the exact exp012 batch ramp, with gradient clipping at 10 | Accounting passed at 109,376,256 parameters and exact fused/reference equivalence; treatment benchmark failed before training because its validation path remained relative | No systems or proxy result. Retry later with absolute train and validation globs; this remains the next architecture candidate if exp021 does not justify a new combination |
 | exp020 | completed proxy s0, killed | Cosine LR schedule against the baseline trapezoid WSD, unchanged 4D architecture and flat 524,288 batch | 3.676178, delta +0.078405 vs baseline (+43.6 sigma); exact 937,426,944-token budget | Strong negative result for this horizon: close cosine unchanged and do not run seeds 1/2 |
-| exp021 | completed proxy s0, quality pass | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | 3.567184, delta -0.014740 vs exp012 (-8.2 sigma); 937,426,944 tokens in 7,224 updates; 6,782.06 s training time | Missed the literal exp012 time bar by 27.30 s but reached exp012's final loss about 137 s earlier. Promote the schedule as the combination base and retain exp021 as the fallback full candidate |
-| exp022 | planned proxy s0, conditional full | On the exact exp021 schedule combine fused 2D SwiGLU, global clip 10, and selective no-WD for the tied embedding/head | Awaiting one direct proxy; compare loss-vs-training-time with exp021 at the exact 937,426,944-token budget | If the package passes the pre-registered winner rule, run exp022 BF16 full at the exact 2.70B-token budget; otherwise run exp021 full. No FP8 is allowed in this first full |
-| exp023 | planned integration benchmark | FP8 compute only for the padded tied lm_head of the selected exp021/exp022 architecture | Awaiting bracketed exact-shape full-update benchmark, including forward/backward, true-vocab loss slicing and tying checks | A measured >=3% complete-step gain with valid numerics authorises a separate FP8 proxy later; it never launches an FP8 proxy or full automatically |
+| exp021 | completed proxy and full s0, full target miss | Uniform 3D GELU MLP plus an aggressive token-linear effective-batch ramp from 16,384 to 262,144 over the first 50% of tokens; LR scaled against the fixed 524,288-token reference batch | Proxy 3.567184; full 3.387356 at 2,700,083,200 tokens in 19,500.15 s training / 19,966.26 s wall time; observed 138,465 tok/s | The full missed the 3.3821 target by 0.005256 despite 8.01% more tokens than baseline. The early advantage vanished near 1.1B tokens; do not rerun this schedule unchanged |
+| exp022 | completed proxy s0, killed | On the exact exp021 schedule combine fused 2D SwiGLU, global clip 10, and selective no-WD for the tied embedding/head | 3.607177, +0.039993 worse than exp021; 1.52% more training time and 1.50% lower throughput; clip 10 never activated | Failed both winner routes. Do not run full or promote SwiGLU/selective-no-WD on this stack; the joint run cannot attribute the loss regression between its additions |
+| exp023 | attempted integration benchmark, infrastructure-invalid | FP8 compute only for the padded tied lm_head of the selected exp021 architecture | No benchmark result: the runner rejected the valid `exp021` winner before measurement; TorchAO also emitted binary-load warnings | Fix winner transport and the pinned TorchAO runtime, then repeat the isolated integration benchmark after the final architecture is selected. No FP8 quality or speed claim exists yet |
+| exp024 | planned direct full s0 | Uniform 3D GELU MLP with an absolute-token staircase batch schedule 64K -> 128K -> 256K -> 524K; fixed 524K LR reference | Awaiting one 2,700,083,200-token full. The switch to 524K is fixed at 939,524,096 tokens, before exp021's full loss advantage disappears | Deliberate exception to the proxy funnel: the decisive transition lies beyond the standard 937,426,944-token proxy. This is the final algorithmic full candidate; no paid launch is authorised by documentation alone |
 
 ## Completed experiments
 
@@ -1602,6 +1603,25 @@ optimizer, loader and RNG state. Any other mismatch is an invalidation, not a
 scientific result. exp012-exp015 checkpoints must never be substituted.
 W&B stage artifact: https://wandb.ai/m-obukhov-home/nocap-baseline/runs/ti786dan
 
+**Overnight-v4 retry.** The v4 branch added the narrowly pinned legacy-schema
+exception, but the suite copied only the remote checkpoints and not the
+captured source required by the validator. A therefore stopped before replay
+with:
+
+```text
+missing captured source beside checkpoint:
+/workspace/nocap-runs-backup/baseline-20260718T074451Z/proxy-seed-0/train_gpt2.py
+```
+
+No spectral records, timing result or parameter update was produced, and B did
+not start. This second attempt is also infrastructure-invalid rather than a
+scientific failure. The local backup now contains both canonical checkpoints
+and their captured `train_gpt2.py`; before the next attempt, generate one
+immutable input manifest covering all three SHA-256 values and stage them as a
+single unit. Then rerun A unchanged and continue to B/C only through the
+already registered gates. W&B failure artifact:
+https://wandb.ai/m-obukhov-home/nocap-baseline/runs/rkqpr1ew
+
 ## exp017 — selective no-weight-decay on the tied embedding
 
 **Status:** completed through proxy seed 0 on 2 August 2026; inconclusive. No
@@ -1840,8 +1860,9 @@ W&B stage artifact: https://wandb.ai/m-obukhov-home/nocap-baseline/runs/o7u2wfwq
 
 ## exp021 — aggressive small-batch ramp on uniform 3D
 
-**Status:** completed direct proxy seed 0 on 2 August 2026; promoted as the
-fallback full candidate and the schedule base for exp022.
+**Status:** completed direct proxy seed 0 on 2 August 2026 and BF16 full seed 0
+on 3 August 2026. The proxy passed on quality, but the full missed the challenge
+target.
 
 **Question.** exp002 measured a mid-run critical batch near 106k, while exp012
 ramps from 131,072 to 524,288 and spends the second half of the proxy at the
@@ -1918,10 +1939,49 @@ registered `sqrt(B / 524288)` LR coupling) as the base for exp022. This does
 not identify smaller batch independently of LR scaling. Keep exp021 as the
 automatic BF16 full fallback if exp022 fails its winner rule.
 
+**Full result.** exp022 failed its winner rule, so the overnight-v4 selector
+correctly launched exp021. The clean implementation SHA was
+`4c072f0ed2ba136026d017dda6ec0174bb19cbb9`. The run completed the exact
+`2,700,083,200`-token budget in 20,805 optimizer updates. Final validation loss
+was `3.387356`, training time was `19,500.15 s`, compile-inclusive wall time was
+`19,966.26 s`, observed throughput was 138,465 tokens/s, and peak memory was
+9,027 MiB. W&B:
+https://wandb.ai/m-obukhov-home/nocap-baseline/runs/aobxji7s
+
+The canonical baseline completed 2,499,805,184 tokens at `3.377696`; exp021
+therefore processed 8.01% more tokens but finished `+0.009661` worse and missed
+the challenge target `3.3821` by `0.005256`. At exp021's final training time,
+linear interpolation of the baseline validation curve gives approximately
+`3.382400`. Raw timing comes from separate run sessions and is reported as
+operational context, not a new same-host causal speedup claim.
+
+The full loss-vs-token comparison explains the failed transfer. Relative to
+baseline, exp021 was ahead by `-0.0312` at 671M tokens, `-0.0264` at 805M,
+`-0.0134` at 940M and only `-0.0002` at 1.074B; the interpolated crossing is
+about 1.17B tokens. The exp021 ramp did not reach its 262,144-token maximum
+until about 1.35B tokens, after the advantage had disappeared. Thus the full
+confirms faster early optimisation from smaller batches/LR coupling but kills
+the horizon-scaled 16K-to-256K schedule as a target-reaching recipe.
+
+Nine immutable milestones from 2.120B through 2.657B tokens plus distinct
+`latest.pt` and `final.pt` were downloaded after the instance was destroyed.
+All eleven files deserialize locally with model, optimizer, loader, RNG,
+source and explicit token metadata; `final.pt` records exactly 2,700,083,200
+tokens and SHA-256
+`465b833ef2a76b9052fd05b51c3a66348962903971230a090a1e3c3a1548fc84`.
+Checkpoint averaging remains an unevaluated offline rescue: the local dataset
+copy lacks the validation shard, so file integrity does not establish an
+averaged validation loss.
+
+**Final decision.** Do not repeat exp021 unchanged. Use its full curve to place
+an absolute-token return to the baseline-sized batch in exp024. Retain exp021
+as a strong systems/early-optimisation result and an honest negative
+proxy-to-full transfer result.
+
 ## exp022 — fused SwiGLU small-batch combination
 
-**Status:** pre-registered before implementation. One direct proxy seed 0 and
-one conditional BF16 full seed 0 are authorised; no FP8 training is authorised.
+**Status:** completed proxy seed 0 on 2 August 2026; killed by the registered
+winner rule. No full run is authorised.
 
 **Hypothesis.** exp021 showed that frequent early updates recover quality at
 small wall-time cost, while exp015 showed that equal-leading-FLOP 2D SwiGLU has
@@ -1957,17 +2017,35 @@ Otherwise exp021 remains the full winner. The selector and all interpolation
 inputs are saved as JSON. A completed proxy must retain `final.pt` and its W&B
 artifact.
 
-**Conditional full.** The winning BF16 branch runs seed 0 to the exact
-`2,700,083,200`-token budget (10,300 final-batch-equivalent updates and a
-multiple of the 262,144-token final effective batch) with
-the same token-indexed schedule fractions and a clean compile cache. FP8 is
-excluded. A later hardware-optimised full requires a separate explicit user
-command after exp023 and an FP8 proxy.
+**Result.** The clean implementation SHA
+`83fb35fadc625cdd56bc4f076cb9773b6051e0fd` completed the exact
+937,426,944-token proxy in 7,224 optimizer updates. Final loss was `3.607177`,
+which is `+0.039993` worse than exp021 and `+0.009403` worse than baseline.
+Training time was `6,885.03 s` and throughput was 136,154 tokens/s: respectively
+1.52% more time and 1.50% less throughput than exp021. It never reached
+exp021's final proxy loss, so neither the quality nor time-to-quality winner
+route passed. W&B:
+https://wandb.ai/m-obukhov-home/nocap-baseline/runs/qc5luw25
+
+Gradient clipping is not an explanation: maximum pre-clip norm was 6.74 in
+warmup and 4.71 in steady state, below threshold 10, so clipping never changed
+an update. Because fused SwiGLU and selective no-WD were added together, the
+remaining quality regression cannot be attributed between them from this run.
+
+**Decision.** Keep exp021 as the selector winner, close exp022, and do not run
+its full or seeds 1/2. Do not promote either SwiGLU or selective no-WD on this
+stack.
+
+**Conditional full outcome.** The selector chose exp021, which then completed
+the registered `2,700,083,200`-token BF16 full described above. No exp022 full
+ran. FP8 remained excluded from that run; any later hardware-optimised full
+still requires a valid exp023 integration result and separate explicit user
+approval.
 
 ## exp023 — FP8 tied-lm-head integration benchmark
 
-**Status:** pre-registered before implementation. This row authorises a
-systems benchmark only, not FP8 proxy or full training.
+**Status:** attempted in overnight-v4 on 2 August 2026; infrastructure-invalid
+before the first benchmark update. No FP8 proxy or full training is authorised.
 
 **Treatment.** After exp022 selects the architecture, instantiate that winner
 with one FP32 master tied embedding/head weight padded from 50,257 to 50,304
@@ -1991,3 +2069,94 @@ against BF16.
 integration benchmark and authorise a separate clean FP8 proxy on the winner.
 Anything else closes or invalidates the hardware path as appropriate. This
 suite never chains an FP8 proxy or FP8 full automatically.
+
+**Attempt result.** `winner.json` validly selected `exp021`, but
+`run_fp8_benchmark.sh` immediately exited 2 with `winner must be exp021 or
+exp022`, before creating a benchmark result. Suite preflight also emitted load
+failures for TorchAO `_C_cutlass_90a` and a CPython-3.10 `_C_mxfp8` extension
+inside the Python-3.12 environment. These are orchestration/runtime failures,
+not negative FP8 evidence.
+
+**Next step.** After the final architecture is selected, reproduce the winner
+transport failure, pin a TorchAO build compatible with the actual Python/CUDA
+runtime, and repeat only the registered integration benchmark. Measure the
+complete production forward/backward path before considering any FP8 full.
+
+## exp024 — absolute-token staircase batch schedule on uniform 3D
+
+**Status:** pre-registered on 3 August 2026 from the completed exp021 full
+curve. One direct BF16 full seed-0 run is proposed; this documentation does not
+authorise paid compute. No FP8 treatment is part of exp024.
+
+**Question.** exp021's horizon-scaled 16K-to-256K ramp created a large early
+loss advantage but kept increasing the batch too slowly. Against the baseline
+full curve, its loss delta shrank from `-0.0312` at 671M tokens to `-0.0264` at
+805M, `-0.0134` at 940M, `-0.0088` at 1.007B and approximately zero at 1.074B;
+the interpolated crossing is about 1.17B. At those points exp021 was still only
+at approximately 131K, 164K, 180K, 197K and 213K effective batches. It reached
+256K only near 1.35B, after the advantage had disappeared.
+
+The hypothesis is that a small number of absolute-token staircase phases can
+retain useful early update frequency while returning to the baseline 524K
+batch and peak LR before the observed advantage is exhausted. Unlike exp021,
+the transition tokens do not scale with the run horizon, so a later budget
+change cannot silently retime the intervention.
+
+**Treatment fixed before implementation.** Keep exp021's uniform 3D GELU
+architecture, token order, seed 0, AdamW betas `(0.9, 0.95)`, weight decay 0.1,
+no clipping, sequence length 1,024, BF16 compute and 524,288-token LR reference.
+Use a 16,384-token microbatch and the following exact schedule:
+
+| Token interval | Effective batch | Accumulation | Updates in phase | Cumulative update at boundary |
+|---|---:|---:|---:|---:|
+| `[0, 201,326,592)` | 65,536 | 4 | 3,072 | 3,072 |
+| `[201,326,592, 469,762,048)` | 131,072 | 8 | 2,048 | 5,120 |
+| `[469,762,048, 939,524,096)` | 262,144 | 16 | 1,792 | 6,912 |
+| `[939,524,096, 2,700,083,200)` | 524,288 | 32 | 3,358 | 10,270 |
+
+The 524K transition is at the 14th 67,108,864-token validation boundary, just
+below 1B tokens. It is deliberately earlier than exp021's observed crossover:
+at 940M the remaining loss buffer was `0.0134`, while by 1.074B it was gone.
+The 256K phase itself is not validated by exp021 at these tokens—exp021 was
+still below 200K—so this direct full remains a genuine risk rather than a
+curve-derived certainty.
+
+At each stage use
+
+```text
+lr(tokens) = wsd_base_lr(tokens) * sqrt(effective_batch_tokens / 524288)
+```
+
+with peak multipliers `sqrt(1/8)`, `1/2`, `sqrt(1/2)` and `1`, respectively.
+Keep exp021 full's exact WSD token spans: 144,965,632 warmup tokens and
+579,862,528 warmdown tokens, with base peak LR 0.0018. Batch/LR jumps are part
+of the treatment; log validation immediately at every phase boundary and the
+first regular validation after it.
+
+**Why direct full instead of the standard proxy.** The standard proxy ends at
+937,426,944 tokens, about 2.1M tokens before the decisive 524K transition. It
+would measure only the three early phases and could not answer whether
+returning to the baseline batch arrests the full-run loss-gap decay. exp021 has
+already supplied a complete full causal pilot for locating this transition.
+Running another standard proxy and promoting it by terminal loss would repeat
+the proxy-to-full mistake exp021 exposed. This is an explicit, final-candidate
+exception to the usual funnel, made to reduce rather than expand the number of
+remaining ablations.
+
+**Run and artifacts.** If Max later authorises paid compute, run seed 0 once to
+the exact 2,700,083,200-token budget. Start from a clean exp024 branch and
+record the exact dataset manifest, Git SHA and source snapshot. Count
+compile-inclusive wall time as primary timing; report per-shape compilation
+spikes separately. Save immutable checkpoints at all three phase boundaries,
+the final checkpoint, and the last 8-10 warmdown milestones. Abort only on
+non-finite loss/gradient or an infrastructure/provenance failure; do not tune a
+boundary during the run.
+
+**Pre-registered interpretation.** Primary success is validation loss at most
+`3.3821`, with time-to-target compared against the same baseline timing
+definition. Also report final loss at the exact token budget, loss-vs-token,
+loss-vs-training-time, observed throughput, optimizer updates, peak memory and
+the loss response around every batch transition. A final loss above `3.3821`
+kills this schedule as a challenge winner. If exp024 fails, do not launch
+another algorithmic full from the current backlog; proceed only with the
+separately gated hardware track or finish the negative-result submission.
