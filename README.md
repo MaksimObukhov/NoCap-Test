@@ -6,6 +6,35 @@ This is an official open test for people interested in joining [BottleCapAI](htt
 
 This project is a fork of [Modded-NanoGPT](https://github.com/KellerJordan/modded-nanogpt) :heart:, rewritten with minimal changes to run on a single GPU (e.g. RTX 3090/4090)
 
+## Submitted result
+
+This branch contains Max Obukhov's final NoCap submission: a uniform `3D` GELU
+MLP with an absolute-token effective-batch staircase of
+`64K -> 128K -> 256K -> 524K`. The seed-0 run reached validation loss
+`3.382004976` in 5.370 h of measured training time; complete local wall time
+was 5.497 h. The nominal comparison with the published 5.401 h baseline is
+0.58%, with the single-seed and cross-host limitations stated explicitly.
+
+- [IDEA.md](IDEA.md) is the research paper and main entry point.
+- [RESULTS.md](RESULTS.md) contains commands, timing definitions, runtime
+  versions, hashes, and the W&B artifact link.
+- [EXPERIMENTS.md](EXPERIMENTS.md) is a per-experiment overview with the
+  reasoning chain — the fastest way to see how the experiments connect.
+
+From a single-RTX-4090 environment that already provides PyTorch
+`2.11.0+cu128`:
+
+```bash
+pip install -r requirements.txt
+wandb login
+python data/cached_fineweb10B.py
+./run.sh
+```
+
+The exact container digest was not captured, so `requirements.txt` does not
+attempt to install or replace PyTorch. See `RESULTS.md` before making an exact
+timing comparison.
+
 ---
 ## 📌 About BottleCapAI
 
@@ -160,4 +189,3 @@ While this project is designed to run on **1 GPU**, there are a few things to ke
 ### Comment on the target metric
 
 The target metric is cross-entropy loss on the FineWeb val set. The goal of the speedrun is to obtain a probability model of language which assigns a probability of at least `math.exp(-3.3821 * 1048576)` to the first 1,048,576 tokens of the FineWeb valset. Hence, we allow evaluation at any sequence length, so long as we still have a valid probability model of language on the **entire** validation set.
-

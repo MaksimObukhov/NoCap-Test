@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,sans-serif;fill:#202124}.axis{stroke:#5f6368;stroke-width:1}.grid{stroke:#e8eaed;stroke-width:1}.label{font-size:16px}.small{font-size:14px}.title{font-size:22px;font-weight:600}</style>
+<text x="90" y="30" class="title">Same-host profiler: baseline vs 3D MLP</text>
+<line x1="90" y1="430.0" x2="865" y2="430.0" class="grid"/>
+<text x="76" y="435.0" text-anchor="end" class="small">0</text>
+<line x1="90" y1="344.77272727272725" x2="865" y2="344.77272727272725" class="grid"/>
+<text x="76" y="349.77272727272725" text-anchor="end" class="small">1</text>
+<line x1="90" y1="259.54545454545456" x2="865" y2="259.54545454545456" class="grid"/>
+<text x="76" y="264.54545454545456" text-anchor="end" class="small">2</text>
+<line x1="90" y1="174.31818181818184" x2="865" y2="174.31818181818184" class="grid"/>
+<text x="76" y="179.31818181818184" text-anchor="end" class="small">3</text>
+<line x1="90" y1="89.09090909090912" x2="865" y2="89.09090909090912" class="grid"/>
+<text x="76" y="94.09090909090912" text-anchor="end" class="small">4</text>
+<rect x="183.16666666666666" y="88.57954545454547" width="62" height="341.4204545454545" fill="#5f6368" rx="3"/>
+<text x="214.16666666666666" y="80.57954545454547" text-anchor="middle" class="small">4.006</text>
+<rect x="224.16666666666666" y="121.13636363636365" width="62" height="308.8636363636364" fill="#1a73e8" rx="3"/>
+<text x="255.16666666666666" y="113.13636363636365" text-anchor="middle" class="small">3.624</text>
+<text x="219.16666666666666" y="460" text-anchor="middle" class="label">Complete step</text>
+<rect x="441.5" y="206.19318181818184" width="62" height="223.80681818181816" fill="#5f6368" rx="3"/>
+<text x="472.5" y="198.19318181818184" text-anchor="middle" class="small">2.626</text>
+<rect x="482.5" y="229.28977272727275" width="62" height="200.71022727272725" fill="#1a73e8" rx="3"/>
+<text x="513.5" y="221.28977272727275" text-anchor="middle" class="small">2.355</text>
+<text x="477.5" y="460" text-anchor="middle" class="label">aten::mm</text>
+<rect x="699.8333333333333" y="400.34090909090907" width="62" height="29.659090909090935" fill="#5f6368" rx="3"/>
+<text x="730.8333333333333" y="392.34090909090907" text-anchor="middle" class="small">0.348</text>
+<rect x="740.8333333333333" y="400.5113636363636" width="62" height="29.488636363636374" fill="#1a73e8" rx="3"/>
+<text x="771.8333333333333" y="392.5113636363636" text-anchor="middle" class="small">0.346</text>
+<text x="735.8333333333333" y="460" text-anchor="middle" class="label">FlashAttention</text>
+<line x1="90" y1="430" x2="865" y2="430" class="axis"/>
+<line x1="90" y1="55" x2="90" y2="430" class="axis"/>
+<text x="22" y="242.5" transform="rotate(-90 22 242.5)" text-anchor="middle" class="label">CUDA time (seconds)</text>
+<rect x="615" y="18" width="18" height="18" fill="#5f6368"/><text x="642" y="32" class="small">baseline</text>
+<rect x="735" y="18" width="18" height="18" fill="#1a73e8"/><text x="762" y="32" class="small">3D MLP</text>
+<text x="450" y="500" text-anchor="middle" class="small" fill="#5f6368">One complete optimizer update; FlashAttention = forward + backward</text>
+</svg>

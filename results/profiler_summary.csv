@@ -1,0 +1,3 @@
+variant,complete_step_cuda_s,aten_mm_cuda_s,flash_attention_cuda_s
+baseline_4d_mlp,4.006,2.626,0.348469
+uniform_3d_mlp,3.624,2.355,0.346440

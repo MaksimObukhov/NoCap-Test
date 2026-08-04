@@ -2,3 +2,6 @@ data/fineweb10B/
 pylog124M/
 logs/
 wandb/
+runs/
+__pycache__/
+*.py[cod]

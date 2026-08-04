@@ -3,6 +3,11 @@ import sys
 import uuid
 import math
 import glob
+import json
+import random
+import hashlib
+import statistics
+import subprocess
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,6 +16,13 @@ from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
+from exp024_schedule import (
+    PHASES as EXP024_PHASES,
+    TARGET_TOKENS as EXP024_TARGET_TOKENS,
+    accumulation_steps_at as exp024_accumulation_steps_at,
+    phase_index_at as exp024_phase_index_at,
+    validate_schedule as validate_exp024_schedule,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -99,8 +111,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # exp024 keeps the measured exp007/exp012 uniform 3D architecture.
+        self.c_fc = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(3 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -258,6 +271,17 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
+    def state_dict(self):
+        return {
+            "current_shard": self.current_shard,
+            "current_position": self.current_position,
+        }
+
+    def load_state_dict(self, state):
+        self.current_shard = state["current_shard"]
+        self.current_position = state["current_position"]
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
     def advance(self):  # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
@@ -291,10 +315,40 @@ def print0(*args, **kwargs):
 
 
 if __name__ == "__main__":
-    import time
     import argparse
+    import time
 
-    print0(f"Running pytorch {torch.version.__version__}")
+    def git_metadata():
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            dirty = bool(
+                subprocess.check_output(
+                    ["git", "status", "--porcelain"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+            )
+            return commit, dirty
+        except (OSError, subprocess.CalledProcessError):
+            return None, None
+
+    def write_json_atomic(path, payload):
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(temporary_path, path)
+
+    def sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    print0(f"Running pytorch {torch.__version__}")
 
     parser = argparse.ArgumentParser()
     # file system input / output
@@ -314,13 +368,24 @@ if __name__ == "__main__":
         "--output_dir",
         type=str,
         default="",
-        help="output directory to which to write logs and checkpoints",
+        help="directory for this run's logs, summary, and checkpoint",
     )
     parser.add_argument(
-        "--model",
+        "--dataset_manifest",
         type=str,
-        default="d12",
-        help="d12|d24|d36|d48",
+        default="",
+        help="preflight dataset manifest saved with local and W&B artifacts",
+    )
+    parser.add_argument("--run_name", type=str, default="")
+    parser.add_argument(
+        "--run_mode",
+        type=str,
+        default="custom",
+        choices=["full", "proxy", "smoke", "custom"],
+    )
+    parser.add_argument("--resume", type=str, default="", help="checkpoint to resume")
+    parser.add_argument(
+        "--model", type=str, default="d12", help="d12|d24|d36|d48"
     )
     # token layout for each step of the optimization
     parser.add_argument(
@@ -333,269 +398,880 @@ if __name__ == "__main__":
         "--grad_accumulation_steps",
         type=int,
         default=1,
-        help="number of gradient accumulation steps",
+        help="final number of gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--batch_ramp_start_accumulation_steps",
+        type=int,
+        default=0,
+        help="initial accumulation steps; 0 disables the batch ramp",
+    )
+    parser.add_argument(
+        "--batch_ramp_fraction",
+        type=float,
+        default=0.0,
+        help="fraction of training tokens over which accumulation grows linearly",
+    )
+    parser.add_argument(
+        "--exp024_staircase",
+        action="store_true",
+        help="use the frozen exp024 absolute-token accumulation schedule",
     )
     parser.add_argument(
         "--sequence_length", type=int, default=64, help="sequence length"
     )
-    # workload (number of steps)
+    parser.add_argument("--seed", type=int, default=0)
+    # workload (token-clock units; fixes the exact token budget)
     parser.add_argument(
-        "--num_iterations", type=int, default=10, help="number of iterations to run"
+        "--num_iterations",
+        type=int,
+        default=10,
+        help="target tokens expressed in token-clock units",
+    )
+    parser.add_argument(
+        "--token_clock_batch_tokens",
+        type=int,
+        default=0,
+        help=(
+            "token quantum used by num/warmup/warmdown/validation/save iteration "
+            "arguments; 0 uses the final effective batch"
+        ),
     )
     # optimization
     parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="learning rate warmup iterations",
+        "--learning_rate", type=float, default=1e-4, help="peak learning rate"
     )
     parser.add_argument(
-        "--warmup_iters", type=int, default=0, help="learning rate warmup iterations"
+        "--lr_reference_batch_tokens",
+        type=int,
+        default=0,
+        help=(
+            "batch-token denominator for sqrt(batch/reference) LR scaling; "
+            "0 uses the final effective batch"
+        ),
+    )
+    parser.add_argument(
+        "--warmup_iters",
+        type=int,
+        default=0,
+        help="warmup span expressed in token-clock units",
     )
     parser.add_argument(
         "--warmdown_iters",
         type=int,
         default=0,
-        help="learning rate warmdown iterations",
+        help="warmdown span expressed in token-clock units",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
-    # evaluation
+    parser.add_argument(
+        "--abort_on_nonfinite",
+        action="store_true",
+        help="abort if train/validation loss or global gradient norm is non-finite",
+    )
+    # evaluation and persistence
     parser.add_argument(
         "--val_loss_every",
         type=int,
         default=0,
-        help="every how mant steps to evaluate val loss?",
+        help="validate every N token-clock units",
     )
     parser.add_argument(
-        "--val_batch_size",
-        type=int,
-        default=16,
-        help="how many batches of val to average?",
+        "--val_batch_size", type=int, default=16, help="validation batch size"
     )
     parser.add_argument(
         "--save_every",
         type=int,
-        default=5000,
-        help="every how many steps to save the checkpoint",
+        default=0,
+        help="save latest.pt every N token-clock units; 0 disables",
     )
     parser.add_argument(
-        "--log_wandb",
+        "--milestone_start_iter",
+        type=int,
+        default=0,
+        help="first token-clock unit eligible for immutable milestones",
+    )
+    parser.add_argument(
+        "--milestone_every",
+        type=int,
+        default=0,
+        help="immutable milestone interval in token-clock units",
+    )
+    parser.add_argument(
+        "--profile",
         action="store_true",
-        help="log to wandb",
+        help="capture a short CPU/CUDA profiler trace",
+    )
+    parser.add_argument(
+        "--profile_wait_steps",
+        type=int,
+        default=3,
+        help="optimizer steps to skip before profiler warmup",
+    )
+    parser.add_argument(
+        "--profile_warmup_steps",
+        type=int,
+        default=1,
+        help="profiler warmup steps to collect and discard",
+    )
+    parser.add_argument(
+        "--profile_active_steps",
+        type=int,
+        default=1,
+        help="optimizer steps to save in the profiler trace",
+    )
+    parser.add_argument("--log_wandb", action="store_true", help="log to W&B")
+    parser.add_argument("--wandb_project", type=str, default="nocap-baseline")
+    parser.add_argument("--wandb_group", type=str, default="")
+    parser.add_argument(
+        "--wandb_checkpoint_artifact",
+        action="store_true",
+        help="upload final.pt as a W&B model artifact after a completed run",
     )
     args = parser.parse_args()
 
-    # args error checking and convenience variables
     B, T = args.batch_size, args.sequence_length
     assert args.model in {"d12", "d24", "d36", "d48"}
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    assert args.num_iterations > 0
+    assert args.warmup_iters + args.warmdown_iters <= args.num_iterations
+    assert args.grad_accumulation_steps > 0
+    assert args.token_clock_batch_tokens >= 0
+    assert args.batch_ramp_start_accumulation_steps >= 0
+    assert 0.0 <= args.batch_ramp_fraction <= 1.0
+    if args.batch_ramp_start_accumulation_steps == 0:
+        assert args.batch_ramp_fraction == 0.0, (
+            "--batch_ramp_fraction requires "
+            "--batch_ramp_start_accumulation_steps"
+        )
+    else:
+        assert args.batch_ramp_fraction > 0.0
+        assert (
+            args.batch_ramp_start_accumulation_steps
+            <= args.grad_accumulation_steps
+        ), "batch ramp must grow toward --grad_accumulation_steps"
+    if args.exp024_staircase:
+        assert args.batch_ramp_start_accumulation_steps == 0
+        assert args.batch_ramp_fraction == 0.0
+        assert args.dataset_manifest and os.path.isfile(args.dataset_manifest)
+    assert args.lr_reference_batch_tokens >= 0
+    assert args.save_every >= 0
+    assert args.milestone_start_iter >= 0
+    assert args.milestone_every >= 0
+    assert (args.milestone_start_iter == 0) == (args.milestone_every == 0)
+    assert args.profile_wait_steps >= 0
+    assert args.profile_warmup_steps >= 0
+    assert args.profile_active_steps > 0
+    profile_schedule_steps = (
+        args.profile_wait_steps
+        + args.profile_warmup_steps
+        + args.profile_active_steps
+    )
+    if args.profile:
+        assert args.num_iterations >= profile_schedule_steps, (
+            "--num_iterations must cover profile wait + warmup + active steps"
+        )
+    assert torch.cuda.is_available(), "CUDA is required"
+
+    # torchrun supplies these variables. WORLD_SIZE=1 is still used for this baseline.
     init_process_group(backend="nccl")
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
-    assert (
-        args.grad_accumulation_steps % ddp_world_size == 0
-    ), "grad_accumulation_steps must be divisible by world size"
-    args.grad_accumulation_steps //= (
-        ddp_world_size  # each gpu does its fraction of the work
-    )
+    if args.exp024_staircase:
+        assert ddp_world_size == 1, "exp024 is registered as a single-GPU run"
+        assert args.grad_accumulation_steps == EXP024_PHASES[-1][1]
+    assert args.grad_accumulation_steps % ddp_world_size == 0
+    if args.batch_ramp_start_accumulation_steps > 0:
+        assert args.batch_ramp_start_accumulation_steps % ddp_world_size == 0
+    args.grad_accumulation_steps //= ddp_world_size
+    args.batch_ramp_start_accumulation_steps //= ddp_world_size
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
-    seed_offset = 0  # each process gets the exact same seed
-    print(f"using device: {device}")
+    master_process = ddp_rank == 0
 
+    # All stochastic sources used by this program start from the recorded seed.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.benchmark = False
+
+    resume_checkpoint = None
+    if args.resume:
+        resume_path = args.resume
+        if os.path.isdir(resume_path):
+            resume_path = os.path.join(resume_path, "checkpoints", "latest.pt")
+        if not os.path.exists(resume_path):
+            raise SystemExit(f"resume checkpoint not found: {resume_path}")
+        resume_checkpoint = torch.load(
+            resume_path, map_location="cpu", weights_only=False
+        )
+        if resume_checkpoint.get("is_final"):
+            raise SystemExit(f"refusing to resume completed run: {resume_path}")
+        resume_keys = (
+            "seed",
+            "run_mode",
+            "model",
+            "batch_size",
+            "grad_accumulation_steps",
+            "batch_ramp_start_accumulation_steps",
+            "batch_ramp_fraction",
+            "exp024_staircase",
+            "sequence_length",
+            "num_iterations",
+            "token_clock_batch_tokens",
+            "learning_rate",
+            "lr_reference_batch_tokens",
+            "warmup_iters",
+            "warmdown_iters",
+            "weight_decay",
+            "milestone_start_iter",
+            "milestone_every",
+        )
+        for key in resume_keys:
+            checkpoint_value = resume_checkpoint["args"].get(key, 0)
+            if checkpoint_value != getattr(args, key):
+                raise ValueError(f"resume checkpoint does not match --{key}")
+
+    run_id = (
+        resume_checkpoint["run_id"]
+        if resume_checkpoint is not None
+        else uuid.uuid4().hex
+    )
+    if not args.run_name:
+        args.run_name = f"{args.run_mode}-seed-{args.seed}"
+    if not args.output_dir:
+        args.output_dir = os.path.join("runs", run_id)
+
+    git_commit, git_dirty = git_metadata()
+    dataset_manifest_sha256 = (
+        sha256_file(args.dataset_manifest) if args.dataset_manifest else None
+    )
+    metadata = {
+        "run_id": run_id,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "seed": args.seed,
+        "gpu_name": torch.cuda.get_device_name(ddp_local_rank),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "world_size": ddp_world_size,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+    }
+
+    metrics_path = os.path.join(args.output_dir, "metrics.jsonl")
+    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    latest_checkpoint_path = os.path.join(checkpoint_dir, "latest.pt")
+    final_checkpoint_path = os.path.join(checkpoint_dir, "final.pt")
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    if master_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        write_json_atomic(
+            os.path.join(args.output_dir, "config.json"),
+            {"args": vars(args), "metadata": metadata},
+        )
+        with open(os.path.join(args.output_dir, "train_gpt2.py"), "w") as f:
+            f.write(code)
+        if args.exp024_staircase:
+            with open("exp024_schedule.py") as source:
+                with open(
+                    os.path.join(args.output_dir, "exp024_schedule.py"), "w"
+                ) as target:
+                    target.write(source.read())
+        if resume_checkpoint is None:
+            with open(metrics_path, "w"):
+                pass
+        else:
+            resume_tokens = resume_checkpoint.get("tokens_seen", 0)
+            kept_records = []
+            if os.path.exists(metrics_path):
+                with open(metrics_path) as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        if json.loads(line).get("tokens_seen", 0) <= resume_tokens:
+                            kept_records.append(line)
+            with open(metrics_path, "w") as f:
+                f.writelines(kept_records)
+
+    def log_local(payload):
+        if master_process:
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    wandb_run = None
+    wandb_run_id = None
     if args.log_wandb and master_process:
         import wandb
-        import datetime
 
-        start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
-        wandb.config.update(args)
-        wandb.save("train_gpt2.py")
-        wandb.save("run.sh")
+        wandb_run_id = (
+            resume_checkpoint.get("wandb_run_id")
+            if resume_checkpoint is not None
+            else None
+        ) or wandb.util.generate_id()
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            group=args.wandb_group or None,
+            name=args.run_name,
+            id=wandb_run_id,
+            resume="allow",
+            config={"args": vars(args), "metadata": metadata},
+        )
+        wandb.save("train_gpt2.py", policy="now")
+        wandb.save("run.sh", policy="now")
+        if args.exp024_staircase:
+            wandb.save("exp024_schedule.py", policy="now")
+        if args.dataset_manifest:
+            wandb.save(
+                args.dataset_manifest,
+                base_path=args.output_dir,
+                policy="now",
+            )
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
-    print0(f"tokens per iteration: {tokens_per_iter:,}")
+    print0(f"using device: {device} ({metadata['gpu_name']})")
+    print0(f"run: {args.run_name} | seed: {args.seed} | output: {args.output_dir}")
 
-    # set up a context manager following the desired dtype and device
+    micro_batch_tokens = B * T * ddp_world_size
+    final_tokens_per_update = micro_batch_tokens * args.grad_accumulation_steps
+    token_clock_batch_tokens = (
+        args.token_clock_batch_tokens or final_tokens_per_update
+    )
+    target_tokens = args.num_iterations * token_clock_batch_tokens
+    warmup_tokens = args.warmup_iters * token_clock_batch_tokens
+    warmdown_tokens = args.warmdown_iters * token_clock_batch_tokens
+    validation_interval_tokens = args.val_loss_every * token_clock_batch_tokens
+    save_interval_tokens = args.save_every * token_clock_batch_tokens
+    milestone_start_tokens = args.milestone_start_iter * token_clock_batch_tokens
+    milestone_interval_tokens = args.milestone_every * token_clock_batch_tokens
+    ramp_start_accumulation = (
+        args.batch_ramp_start_accumulation_steps
+        or args.grad_accumulation_steps
+    )
+    ramp_tokens = int(target_tokens * args.batch_ramp_fraction)
+    lr_reference_batch_tokens = (
+        args.lr_reference_batch_tokens or final_tokens_per_update
+    )
+    assert target_tokens % micro_batch_tokens == 0
+    assert lr_reference_batch_tokens > 0
+    exp024_schedule_records = []
+    exp024_phase_boundaries = set()
+    if args.exp024_staircase:
+        exp024_schedule_records = validate_exp024_schedule(micro_batch_tokens)
+        exp024_phase_boundaries = {
+            boundary for boundary, _accumulation in EXP024_PHASES[:-1]
+        }
+        assert target_tokens == EXP024_TARGET_TOKENS
+        assert final_tokens_per_update == exp024_schedule_records[-1][
+            "effective_batch_tokens"
+        ]
+    print0(
+        f"token budget: {target_tokens:,} | "
+        f"microbatch: {micro_batch_tokens:,} tokens | "
+        f"final effective batch: {final_tokens_per_update:,} tokens | "
+        f"token clock: {token_clock_batch_tokens:,} tokens | "
+        f"LR reference batch: {lr_reference_batch_tokens:,} tokens"
+    )
+    if args.exp024_staircase:
+        print0(f"exp024 staircase: {exp024_schedule_records}")
+    elif ramp_start_accumulation != args.grad_accumulation_steps:
+        print0(
+            "batch ramp: "
+            f"{ramp_start_accumulation} -> {args.grad_accumulation_steps} "
+            f"microbatches over first {args.batch_ramp_fraction:.1%} of tokens"
+        )
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
     tokens_per_iter_val = args.val_batch_size * T * ddp_world_size
     assert VAL_TOKENS % tokens_per_iter_val == 0
     val_steps = VAL_TOKENS // tokens_per_iter_val
-
     val_loader = DistributedDataLoader(
         args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
     )
-    x, y = train_loader.next_batch()
 
-    # init the model from scratch
     num_vocab = 50257
     model_config = {
-        "d12": GPTConfig(
-            vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768
-        ),  # 124M GPT-2
+        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
         "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
         "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
         "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
     }[args.model]
-    model = GPT(model_config)
-    model = model.train().cuda()
+    base_model = GPT(model_config)
+    if resume_checkpoint is not None:
+        base_model.load_state_dict(resume_checkpoint["model"])
+    base_model = base_model.train().cuda()
+
     if hasattr(config, "coordinate_descent_tuning"):
-        config.coordinate_descent_tuning = True  # suggested by @Chillee
+        config.coordinate_descent_tuning = True
     print0("compiling the model...")
-    model = torch.compile(
-        model
-    )  # NOTE: this might cause issues depending on your GPU, consider turning it off
-
-    # here we wrap model into DDP container
+    model = torch.compile(base_model)
     model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module  # always contains the "raw" unwrapped model
 
-    # init the optimizer
-    optimizer = raw_model.configure_optimizers(
+    optimizer = base_model.configure_optimizers(
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
         betas=(0.9, 0.95),
         device_type=device,
     )
 
-    # learning rate decay scheduler (linear warmup and warmdown)
-    def get_lr(it):
-        assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
-        if it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
-        # 2) constant lr for a while
-        elif it < args.num_iterations - args.warmdown_iters:
-            return args.learning_rate
-        # 3) linear warmdown
-        else:
-            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-            return args.learning_rate * decay_ratio
-
-    run_id = str(uuid.uuid4())
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if master_process and args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "%s.log" % run_id)
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
-
+    completed_steps = 0
+    tokens_seen = 0
+    last_validation_tokens = -1
     training_time_ms = 0.0
-    # start the clock
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    previous_wall_time_seconds = 0.0
+    final_val_loss = None
+    if resume_checkpoint is not None:
+        optimizer.load_state_dict(resume_checkpoint["optimizer"])
+        train_loader.load_state_dict(resume_checkpoint["train_loader"])
+        x = resume_checkpoint["next_x"].to(device)
+        y = resume_checkpoint["next_y"].to(device)
+        completed_steps = resume_checkpoint["next_step"]
+        tokens_seen = resume_checkpoint["tokens_seen"]
+        last_validation_tokens = resume_checkpoint.get(
+            "last_validation_tokens", tokens_seen
+        )
+        training_time_ms = resume_checkpoint["training_time_ms"]
+        previous_wall_time_seconds = resume_checkpoint.get("wall_time_seconds", 0.0)
+        final_val_loss = resume_checkpoint.get("last_val_loss")
+        random.setstate(resume_checkpoint["rng_state"]["python"])
+        np.random.set_state(resume_checkpoint["rng_state"]["numpy"])
+        torch.set_rng_state(resume_checkpoint["rng_state"]["torch"])
+        torch.cuda.set_rng_state_all(resume_checkpoint["rng_state"]["cuda"])
+        print0(
+            f"resuming from completed update {completed_steps} "
+            f"at {tokens_seen:,} tokens"
+        )
+    else:
+        x, y = train_loader.next_batch()
 
-    # begin training
-    for step in range(args.num_iterations + 1):
-        last_step = step == args.num_iterations
+    def accumulation_steps_at(current_tokens):
+        if args.exp024_staircase:
+            return exp024_accumulation_steps_at(current_tokens)
+        if ramp_start_accumulation == args.grad_accumulation_steps:
+            return args.grad_accumulation_steps
+        if current_tokens >= ramp_tokens:
+            return args.grad_accumulation_steps
+        progress = current_tokens / ramp_tokens
+        accumulation = ramp_start_accumulation + progress * (
+            args.grad_accumulation_steps - ramp_start_accumulation
+        )
+        return math.floor(accumulation + 0.5)
 
-        # once in a while evaluate the validation dataset
-        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
+    def base_lr_at(current_tokens, update_tokens):
+        if current_tokens < warmup_tokens:
+            return args.learning_rate * min(
+                (current_tokens + update_tokens) / warmup_tokens, 1.0
+            )
+        if current_tokens < target_tokens - warmdown_tokens:
+            return args.learning_rate
+        return args.learning_rate * (
+            (target_tokens - current_tokens) / warmdown_tokens
+        )
+
+    def phase_at(current_tokens):
+        if current_tokens < warmup_tokens:
+            return "warmup"
+        if current_tokens < target_tokens - warmdown_tokens:
+            return "steady"
+        return "warmdown"
+
+    session_wall_start = time.perf_counter()
+
+    def elapsed_wall_seconds():
+        return previous_wall_time_seconds + time.perf_counter() - session_wall_start
+
+    def save_checkpoint(next_step, kind):
+        if not master_process:
+            return None
+        if kind == "latest":
+            destination = latest_checkpoint_path
+        elif kind == "milestone":
+            destination = os.path.join(
+                checkpoint_dir, f"milestone-tokens{tokens_seen:012d}.pt"
+            )
+            if os.path.exists(destination):
+                print0(f"milestone already exists, not rewriting: {destination}")
+                return destination
+        elif kind == "phase":
+            destination = os.path.join(
+                checkpoint_dir, f"phase-boundary-tokens{tokens_seen:012d}.pt"
+            )
+            if os.path.exists(destination):
+                print0(f"phase checkpoint already exists, not rewriting: {destination}")
+                return destination
+        elif kind == "final":
+            destination = final_checkpoint_path
+        else:
+            raise ValueError(f"unknown checkpoint kind: {kind}")
+        checkpoint = {
+            "version": 3,
+            "run_id": run_id,
+            "wandb_run_id": wandb_run_id,
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "next_step": next_step,
+            "tokens_seen": tokens_seen,
+            "target_tokens": target_tokens,
+            "last_validation_tokens": last_validation_tokens,
+            "train_loader": train_loader.state_dict(),
+            # The loader cursor is already beyond this prefetched batch.
+            "next_x": x.cpu(),
+            "next_y": y.cpu(),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all(),
+            },
+            "training_time_ms": training_time_ms,
+            "wall_time_seconds": elapsed_wall_seconds(),
+            "last_val_loss": final_val_loss,
+            "args": vars(args),
+            "metadata": metadata,
+            "code": code,
+            "kind": kind,
+            "is_final": kind == "final",
+        }
+        temporary_path = f"{destination}.tmp"
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, destination)
+        print0(
+            f"saved {kind} checkpoint: {destination} "
+            f"(next update {next_step}, {tokens_seen:,} tokens)"
+        )
+        return destination
+
+    profiler = None
+    if args.profile:
+        profile_dir = os.path.join(args.output_dir, "profile")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        def save_profile_trace(prof):
+            trace_path = os.path.join(profile_dir, f"rank{ddp_rank}_trace.json")
+            table_path = os.path.join(profile_dir, f"rank{ddp_rank}_key_averages.txt")
+            prof.export_chrome_trace(trace_path)
+            with open(table_path, "w") as f:
+                f.write(
+                    prof.key_averages().table(
+                        sort_by="self_cuda_time_total",
+                        row_limit=30,
+                    )
+                )
+                f.write("\n")
+            print0(f"saved profiler trace: {trace_path}")
+            print0(f"saved profiler table: {table_path}")
+
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=args.profile_wait_steps,
+                warmup=args.profile_warmup_steps,
+                active=args.profile_active_steps,
+                repeat=1,
+            ),
+            on_trace_ready=save_profile_trace,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        profiler.start()
+        print0(
+            "profiler enabled: "
+            f"wait={args.profile_wait_steps}, "
+            f"warmup={args.profile_warmup_steps}, "
+            f"active={args.profile_active_steps}"
+        )
+
+    phase_grad_norms = {}
+
+    while True:
+        assert tokens_seen <= target_tokens
+        last_step = tokens_seen == target_tokens
+        validation_due = (
+            args.val_loss_every > 0
+            and (
+                last_validation_tokens < 0
+                or tokens_seen // validation_interval_tokens
+                > last_validation_tokens // validation_interval_tokens
+                or last_step
+            )
+        )
+
+        if validation_due:
             model.eval()
-            val_loader.reset()  # reset the val loader so that it starts from the beginning
+            val_loader.reset()
             with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(val_steps):  # always fiexed number of validation steps
+                val_loss = torch.zeros(1, device=device)
+                for _ in range(val_steps):
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
-            # log to console and to file
-            print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
-            if master_process:
-                if args.log_wandb:
-                    wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)
-                    wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
-                if logfile is not None:
-                    with open(logfile, "a") as f:
-                        f.write("s:%d val:%f\n" % (step, val_loss))
+            final_val_loss = val_loss.item()
+            validation_record = {
+                "event": "validation",
+                "step": completed_steps,
+                "tokens_seen": tokens_seen,
+                "val_loss": final_val_loss,
+                "training_time_seconds": training_time_ms / 1000,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+            print0(
+                f"update:{completed_steps} | tokens:{tokens_seen:,}/"
+                f"{target_tokens:,} | val loss {final_val_loss:.6f}"
+            )
+            log_local(validation_record)
+            if wandb_run is not None:
+                wandb_run.log(validation_record)
+            last_validation_tokens = tokens_seen
+            if args.abort_on_nonfinite and not math.isfinite(final_val_loss):
+                if wandb_run is not None:
+                    wandb_run.finish(exit_code=3)
+                destroy_process_group()
+                raise SystemExit("non-finite validation loss")
 
-            # restart the clock
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
-        # bit confusing: we want to make sure to eval on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
         if last_step:
             break
 
-        # --------------- TRAINING SECTION BEGIN -----------------
-        model.train()
-        train_loss = torch.zeros(1, device=device)
-        for micro_step in range(args.grad_accumulation_steps):
-            model.require_backward_grad_sync = (
-                micro_step == args.grad_accumulation_steps - 1
-            )  # sync only on last micro step to avoid overhead
-            # forward pass
-            with ctx:
-                _, loss = model(x, y, return_logits=False)
-                loss = (
-                    loss / args.grad_accumulation_steps
-                )  # scale loss for gradient accumulation
-                train_loss += loss.detach()
-            # advance the dataset for the next batch
-            x, y = train_loader.next_batch()
-            # backward pass
-            loss.backward()
-
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-        # step the optimizer
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
+        remaining_microbatches = (
+            target_tokens - tokens_seen
+        ) // micro_batch_tokens
+        current_accumulation_steps = min(
+            accumulation_steps_at(tokens_seen), remaining_microbatches
+        )
+        assert current_accumulation_steps > 0
+        update_tokens = current_accumulation_steps * micro_batch_tokens
 
         torch.cuda.synchronize()
-        # time and print
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        # tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        train_step_start = time.perf_counter()
+        model.train()
+        train_loss = torch.zeros(1, device=device)
+        for micro_step in range(current_accumulation_steps):
+            model.require_backward_grad_sync = (
+                micro_step == current_accumulation_steps - 1
+            )
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                loss = loss / current_accumulation_steps
+                train_loss += loss.detach()
+            x, y = train_loader.next_batch()
+            loss.backward()
+
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        lossf = train_loss.item()  # keep track of the mean loss
-        print0(
-            f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
+        lossf = train_loss.item()
+        pre_clip_grad_norm = torch.nn.utils.clip_grad_norm_(
+            base_model.parameters(), float("inf"), error_if_nonfinite=False
+        ).item()
+        if args.abort_on_nonfinite and not (
+            math.isfinite(lossf) and math.isfinite(pre_clip_grad_norm)
+        ):
+            abort_record = {
+                "event": "abort",
+                "reason": "nonfinite",
+                "step": completed_steps,
+                "tokens_seen": tokens_seen,
+                "train_loss": lossf,
+                "pre_clip_grad_norm": pre_clip_grad_norm,
+                "training_time_seconds": training_time_ms / 1000,
+                "wall_time_seconds": elapsed_wall_seconds(),
+            }
+            log_local(abort_record)
+            if wandb_run is not None:
+                wandb_run.log(abort_record)
+                wandb_run.finish(exit_code=3)
+            destroy_process_group()
+            raise SystemExit("non-finite loss or gradient")
+
+        base_lr = base_lr_at(tokens_seen, update_tokens)
+        lr_batch_scale = math.sqrt(
+            update_tokens / lr_reference_batch_tokens
         )
-        # log to logile
-        if master_process and logfile is not None:
-            with open(logfile, "a") as f:
-                f.write("s:%d trn:%f\n" % (step, lossf))
+        lr = base_lr * lr_batch_scale
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        step_time_ms = 1000 * (time.perf_counter() - train_step_start)
+        training_time_ms += step_time_ms
 
-        if master_process and (step + 1) % args.save_every == 0:
-            log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-            os.makedirs("logs/%s" % run_id, exist_ok=True)
-            torch.save(log, "logs/%s/model_step%06d.pt" % (run_id, step))
+        previous_tokens_seen = tokens_seen
+        phase = phase_at(previous_tokens_seen)
+        batch_phase_index = (
+            exp024_phase_index_at(previous_tokens_seen)
+            if args.exp024_staircase
+            else None
+        )
+        tokens_seen += update_tokens
+        completed_steps += 1
+        phase_grad_norms.setdefault(phase, []).append(pre_clip_grad_norm)
+        train_record = {
+            "event": "train",
+            "step": completed_steps,
+            "tokens_seen": tokens_seen,
+            "train_loss": lossf,
+            "base_learning_rate": base_lr,
+            "learning_rate": lr,
+            "lr_batch_scale": lr_batch_scale,
+            "grad_accumulation_steps": current_accumulation_steps,
+            "effective_batch_tokens": update_tokens,
+            "batch_phase_index": batch_phase_index,
+            "phase": phase,
+            "pre_clip_grad_norm": pre_clip_grad_norm,
+            "step_time_ms": step_time_ms,
+            "training_time_seconds": training_time_ms / 1000,
+            "tokens_per_second": tokens_seen / (training_time_ms / 1000),
+            "wall_time_seconds": elapsed_wall_seconds(),
+        }
+        print0(
+            f"update:{completed_steps} | tokens:{tokens_seen:,}/{target_tokens:,} | "
+            f"batch:{update_tokens:,} | loss {lossf:.6f} | lr:{lr:.6g} | "
+            f"|g|:{pre_clip_grad_norm:.4f} | "
+            f"train_time:{training_time_ms/1000:.2f}s | step:{step_time_ms:.2f}ms"
+        )
+        log_local(train_record)
+        if wandb_run is not None:
+            wandb_run.log(train_record)
 
+        crossed_save_boundary = (
+            args.save_every > 0
+            and tokens_seen // save_interval_tokens
+            > previous_tokens_seen // save_interval_tokens
+        )
+        if crossed_save_boundary:
+            save_checkpoint(completed_steps, kind="latest")
+
+        crossed_milestone_boundary = False
+        if args.milestone_every > 0 and tokens_seen >= milestone_start_tokens:
+            if previous_tokens_seen < milestone_start_tokens:
+                crossed_milestone_boundary = True
+            else:
+                crossed_milestone_boundary = (
+                    (tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                    > (previous_tokens_seen - milestone_start_tokens)
+                    // milestone_interval_tokens
+                )
+        if crossed_milestone_boundary:
+            save_checkpoint(completed_steps, kind="milestone")
+
+        crossed_exp024_phase_boundary = (
+            args.exp024_staircase
+            and tokens_seen in exp024_phase_boundaries
+        )
+        if crossed_exp024_phase_boundary:
+            save_checkpoint(completed_steps, kind="phase")
+
+        if profiler is not None:
+            # One profiler step is one complete optimizer update, including accumulation.
+            profiler.step()
+
+    if profiler is not None:
+        profiler.stop()
+
+    peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
+    training_time_seconds = training_time_ms / 1000
+    gradient_health_by_phase = {}
+    for phase, values in sorted(phase_grad_norms.items()):
+        ordered = sorted(values)
+        gradient_health_by_phase[phase] = {
+            "updates": len(ordered),
+            "median": statistics.median(ordered),
+            "p90": ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))],
+            "max": ordered[-1],
+        }
+    summary = {
+        "status": "complete",
+        "run_id": run_id,
+        "run_name": args.run_name,
+        "run_mode": args.run_mode,
+        "seed": args.seed,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "gpu_name": metadata["gpu_name"],
+        "final_val_loss": final_val_loss,
+        "num_iterations": args.num_iterations,
+        "optimizer_updates": completed_steps,
+        "target_tokens": target_tokens,
+        "tokens_seen": tokens_seen,
+        "training_time_seconds": training_time_seconds,
+        "wall_time_seconds": elapsed_wall_seconds(),
+        "tokens_per_second": tokens_seen / training_time_seconds,
+        "peak_memory_mib": peak_memory_mib,
+        "parameter_count": sum(p.numel() for p in base_model.parameters()),
+        "mlp_ratio": 3.0,
+        "token_clock_batch_tokens": token_clock_batch_tokens,
+        "lr_reference_batch_tokens": lr_reference_batch_tokens,
+        "exp024_staircase": args.exp024_staircase,
+        "batch_schedule": exp024_schedule_records,
+        "dataset_manifest": {
+            "path": args.dataset_manifest,
+            "sha256": dataset_manifest_sha256,
+        },
+        "gradient_health_by_phase": gradient_health_by_phase,
+    }
+    print0(f"peak memory consumption: {peak_memory_mib} MiB")
+    for phase, phase_stats in gradient_health_by_phase.items():
+        print0(
+            f"grad health [{phase}]: n={phase_stats['updates']} "
+            f"median={phase_stats['median']:.4f} "
+            f"p90={phase_stats['p90']:.4f} max={phase_stats['max']:.4f}"
+        )
+    final_val_text = "n/a" if final_val_loss is None else f"{final_val_loss:.6f}"
     print0(
-        f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB"
+        f"final val loss: {final_val_text} | tokens: {tokens_seen:,} | "
+        f"optimizer updates: {completed_steps:,} | "
+        f"train time: {training_time_seconds/3600:.3f}h | "
+        f"throughput: {summary['tokens_per_second']:,.0f} tok/s"
     )
 
-    # -------------------------------------------------------------------------
-
     if master_process:
-        log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-        os.makedirs("logs/%s" % run_id, exist_ok=True)
-        torch.save(log, "logs/%s/final.pt" % run_id)
+        save_checkpoint(completed_steps, kind="final")
+        digest = hashlib.sha256()
+        with open(final_checkpoint_path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(block)
+        summary["final_checkpoint"] = {
+            "path": final_checkpoint_path,
+            "sha256": digest.hexdigest(),
+            "bytes": os.path.getsize(final_checkpoint_path),
+            "next_step": completed_steps,
+            "tokens_seen": tokens_seen,
+        }
+        summary["milestone_checkpoints"] = [
+            {"path": path, "bytes": os.path.getsize(path)}
+            for path in sorted(
+                glob.glob(os.path.join(checkpoint_dir, "milestone-tokens*.pt"))
+            )
+        ]
+        summary["phase_boundary_checkpoints"] = [
+            {"path": path, "bytes": os.path.getsize(path)}
+            for path in sorted(
+                glob.glob(os.path.join(checkpoint_dir, "phase-boundary-tokens*.pt"))
+            )
+        ]
+        write_json_atomic(summary_path, summary)
+        if wandb_run is not None:
+            wandb_run.summary.update(summary)
+            wandb.save(summary_path, policy="now")
+            if args.wandb_checkpoint_artifact:
+                artifact = wandb.Artifact(
+                    f"{args.run_name}-final-checkpoint",
+                    type="model",
+                    metadata={
+                        "git_commit": git_commit,
+                        "seed": args.seed,
+                        "tokens_seen": tokens_seen,
+                        "sha256": digest.hexdigest(),
+                    },
+                )
+                artifact.add_file(final_checkpoint_path, name="final.pt")
+                wandb_run.log_artifact(artifact)
+            wandb_run.finish()
 
-    # -------------------------------------------------------------------------
-    # clean up nice
     destroy_process_group()

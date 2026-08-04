@@ -1,0 +1,23 @@
+{
+  "status": "complete",
+  "experiment": "exp024",
+  "run_name": "exp024-absolute-token-staircase-full-seed-0",
+  "seed": 0,
+  "git_commit": "9e86007ff149f8070741822a9f2b6d65fcc8abfd",
+  "git_dirty": false,
+  "gpu_name": "NVIDIA GeForce RTX 4090",
+  "torch_version": "2.11.0+cu128",
+  "cuda_version": "12.8",
+  "world_size": 1,
+  "parameter_count": 109376256,
+  "tokens_seen": 2700083200,
+  "optimizer_updates": 10270,
+  "final_val_loss": 3.382004976272583,
+  "training_time_seconds": 19330.647700868725,
+  "wall_time_seconds": 19787.83994572301,
+  "tokens_per_second": 139678.87893785667,
+  "peak_memory_mib": 9027,
+  "dataset_manifest_sha256": "d8b5d102aa39a21048e611d8bb02f12af0eb164d3aab9056fede22a9f9323582",
+  "final_checkpoint_sha256": "180d25d8c6d79cdab628046359816c09d98dca4762255215ac2d87eeffafd328",
+  "wandb_url": "https://wandb.ai/m-obukhov-home/nocap-baseline/runs/pplwt5ss"
+}
